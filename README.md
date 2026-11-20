@@ -54,7 +54,9 @@ Then install Layr in Chrome:
 5. Click its inspect icon.
 6. Explore its details in the Layr side panel.
 
-Press **Esc** to clear the selected element. Turn Inspector mode **OFF** to interact with the website normally. Closing the side panel alone does not turn inspection off.
+On a tab that has not been activated yet, a message below the toggle explains how to grant access using Layr's icon in Chrome's top toolbar. After connecting, use the panel toggle to turn inspection on or off.
+
+Press **Esc** to clear the selected element. Turn Inspector mode **OFF**, or close the Layr side panel, to stop inspecting and interact with the website normally.
 
 ### After Making Changes
 

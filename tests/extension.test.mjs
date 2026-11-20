@@ -425,6 +425,55 @@ test(
       0,
       "navigation starts with no overlays",
     );
+
+    // Closing the real Chrome panel must release the page's inspection surface.
+    await panel.close();
+    await browserCdp.send("Extensions.triggerAction", {
+      id,
+      targetId: targetInfo.targetId,
+    });
+    await page.locator("[data-layr-overlay]").waitFor({ state: "attached" });
+    await waitFor((state) => state.enabled);
+    await page.locator("#target").click({ force: true });
+    await waitFor((state) => state.inspection?.id === "target");
+    await worker.evaluate(async (tabId) => {
+      const tab = await chrome.tabs.get(tabId);
+      await chrome.sidePanel.close({ windowId: tab.windowId });
+    }, tabId);
+    state = await waitFor((state) => !state.enabled);
+    assert.equal(state.inspection, null, "closing the panel clears selection");
+    assert.equal(await page.locator("[data-layr-overlay]").count(), 0);
+    assert.equal(
+      await worker.evaluate(
+        (tabId) => chrome.action.getBadgeText({ tabId }),
+        tabId,
+      ),
+      "",
+      "closing the panel clears the ON badge",
+    );
+    await page.locator("#target").click();
+    assert.equal(
+      await page.evaluate(() => window.pageClicks),
+      1,
+      "page clicks work again after closing the panel",
+    );
+
+    // Test panel-context destruction independently of the newer onClosed API.
+    const standalone = await context.newPage();
+    await standalone.goto(`chrome-extension://${id}/sidepanel.html`);
+    await page.bringToFront();
+    await standalone.locator('[role="switch"][aria-checked="false"]').waitFor();
+    await standalone.getByRole("switch", { name: "Inspection mode" }).click();
+    await waitFor((state) => state.enabled);
+    await page.locator("#target").click({ force: true });
+    await standalone.getByText("SELECTED ELEMENT").waitFor();
+    await standalone.close();
+    await waitFor((state) => !state.enabled);
+    assert.equal(
+      await page.locator("[data-layr-overlay]").count(),
+      0,
+      "destroying the panel context disconnects and stops inspection",
+    );
     assert.deepEqual(errors, [], "no page or panel runtime errors");
   },
 );

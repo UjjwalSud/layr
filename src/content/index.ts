@@ -19,6 +19,7 @@ if (!global.__layrInstalled) {
   let frame = 0;
   let point: { x: number; y: number } | null = null;
   let buttonBounds: { left: number; top: number; width: number } | null = null;
+  const panelSessions = new Set<chrome.runtime.Port>();
 
   const state = (): InspectorState => ({ enabled, inspection });
   const publish = () => {
@@ -259,6 +260,21 @@ if (!global.__layrInstalled) {
     });
     publish();
   }
+
+  // These ports connect directly to the panel, so service-worker suspension
+  // cannot leave inspection running after the last panel is closed.
+  chrome.runtime.onConnect.addListener((port) => {
+    if (
+      port.name !== "LAYR_PANEL_SESSION" ||
+      port.sender?.url !== chrome.runtime.getURL("sidepanel.html")
+    )
+      return;
+    panelSessions.add(port);
+    port.onDisconnect.addListener(() => {
+      panelSessions.delete(port);
+      if (!panelSessions.size) setEnabled(false);
+    });
+  });
 
   chrome.runtime.onMessage.addListener(
     (message: ContentCommand, _sender, respond) => {

@@ -450,6 +450,10 @@ export function App() {
             role="switch"
             aria-label="Inspection mode"
             aria-checked={enabled}
+            aria-describedby={error ? "page-access-help" : undefined}
+            title={
+              error || (enabled ? "Turn inspection off" : "Turn inspection on")
+            }
             disabled={busy || !tab}
             onClick={() => void run({ type: "LAYR_ENABLE", enabled: !enabled })}
           >
@@ -465,6 +469,19 @@ export function App() {
         <span className={`status-dot ${enabled ? "live" : ""}`} />
         <span>{enabled ? "Inspecting" : "Standby"}</span>
       </div>
+      {error && (
+        <div className="error activation-help" id="page-access-help" role="status">
+          <AlertCircle size={16} />
+          <div>
+            <strong>
+              {tab?.url && !/^(https?:|file:)/.test(tab.url)
+                ? "Inspection unavailable on this page"
+                : "Page access needed"}
+            </strong>
+            <p>{error}</p>
+          </div>
+        </div>
+      )}
       <nav className="tabs" aria-label="Inspector sections">
         {tabs.map(({ name, icon: Icon }) => (
           <button
@@ -568,14 +585,10 @@ export function App() {
           <p>
             {enabled
               ? "Hover over any element on the page, then click the blue inspect icon to explore its HTML, styles, and layout."
-              : "Click the Layr icon in your Chrome toolbar to start exploring the page."}
+              : error
+                ? "Layr can inspect HTML and CSS on regular websites."
+                : "Turn on the toggle above to resume inspecting this page."}
           </p>
-          {error && (
-            <div className="error" role="status">
-              <AlertCircle size={16} />
-              <p>{error}</p>
-            </div>
-          )}
           <div className="steps">
             <div>
               <span>01</span>

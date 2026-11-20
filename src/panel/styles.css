@@ -826,6 +826,16 @@ kbd {
   line-height: 1.8;
   margin: 0;
 }
+.activation-help {
+  margin: 0 20px 17px;
+  max-width: none;
+}
+.activation-help strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
 footer {
   display: flex;
   justify-content: space-between;

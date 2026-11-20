@@ -16,6 +16,21 @@ export function useInspector() {
   const currentTab = useRef<number | undefined>(undefined);
   const generation = useRef(0);
   const windowId = useRef<number | undefined>(undefined);
+  const sessions = useRef(new Map<number, chrome.runtime.Port>());
+
+  const watchTab = useCallback((tabId: number) => {
+    if (sessions.current.has(tabId)) return;
+    const port = chrome.tabs.connect(tabId, {
+      name: "LAYR_PANEL_SESSION",
+      frameId: 0,
+    });
+    sessions.current.set(tabId, port);
+    port.onDisconnect.addListener(() => {
+      // Navigation and closed tabs can disconnect a session with lastError set.
+      void chrome.runtime.lastError;
+      if (sessions.current.get(tabId) === port) sessions.current.delete(tabId);
+    });
+  }, []);
 
   const sync = useCallback(async () => {
     const version = ++generation.current;
@@ -31,11 +46,14 @@ export function useInspector() {
     if (active?.id === undefined) return;
     try {
       const next = await command(active.id, { type: "LAYR_GET_STATE" });
-      if (version === generation.current) setState(next);
+      if (version === generation.current) {
+        if (next.enabled) watchTab(active.id);
+        setState(next);
+      }
     } catch {
       if (version === generation.current) setError(pageError(active.url));
     }
-  }, []);
+  }, [watchTab]);
 
   useEffect(() => {
     let alive = true;
@@ -48,6 +66,14 @@ export function useInspector() {
       message: StateEvent | { type: "LAYR_UNAVAILABLE"; tabId: number },
       sender: chrome.runtime.MessageSender,
     ) => {
+      if (
+        message.type === "LAYR_STATE" &&
+        message.state.enabled &&
+        sender.tab?.id !== undefined &&
+        sender.tab.windowId === windowId.current &&
+        sender.frameId === 0
+      )
+        watchTab(sender.tab.id);
       if (
         message.type === "LAYR_STATE" &&
         sender.tab?.id === currentTab.current &&
@@ -76,8 +102,10 @@ export function useInspector() {
       chrome.runtime.onMessage.removeListener(receive);
       chrome.tabs.onActivated.removeListener(activate);
       chrome.tabs.onUpdated.removeListener(update);
+      for (const session of sessions.current.values()) session.disconnect();
+      sessions.current.clear();
     };
-  }, [sync]);
+  }, [sync, watchTab]);
 
   async function run(message: ContentCommand) {
     const id = currentTab.current;
@@ -89,6 +117,7 @@ export function useInspector() {
           ? await enableTab(id)
           : await command(id, message);
       if (currentTab.current === id) {
+        if (next.enabled) watchTab(id);
         setState(next);
         setError("");
       }

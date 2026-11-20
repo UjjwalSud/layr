@@ -20,8 +20,8 @@ export async function enableTab(tabId: number): Promise<InspectorState> {
 
 export function pageError(url?: string): string {
   if (url && !/^(https?:|file:)/.test(url))
-    return "Chrome protects this page. Open a regular website and click the Layr toolbar icon.";
+    return "Chrome blocks inspection on internal pages such as chrome://extensions and chrome://settings. Layr cannot be enabled here. Open a regular website and click the Layr toolbar icon.";
   if (url?.startsWith("file:"))
     return "Allow access to file URLs in Layr’s extension settings, then click its toolbar icon.";
-  return "Click the Layr toolbar icon to grant access to this tab. Chrome’s internal pages, the Web Store, and PDF viewer cannot be inspected.";
+  return "To start on this tab, click Layr’s icon in Chrome’s top toolbar. After that, use the toggle here to turn inspection on or off. Chrome blocks inspection on chrome:// pages, the Web Store, and its PDF viewer; Layr cannot be enabled on those pages.";
 }
