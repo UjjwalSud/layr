@@ -1,14 +1,16 @@
-import type { Declaration, Inspection, SourceRule } from "../shared/types";
+import type { Declaration, ElementLink, Inspection, SourceRule } from "../shared/types";
+import { isSensitiveName, redactInspection, sanitizedElement, sensitiveValues } from "./privacy";
+import { classifyDeclarations } from "./cascade";
 
 export function declarations(style: CSSStyleDeclaration): Declaration[] {
   return Array.from(style, (property) => ({
     property,
-    value: style.getPropertyValue(property).trim(),
+    value: isSensitiveName(property) ? "[redacted]" : style.getPropertyValue(property).trim(),
     important: style.getPropertyPriority(property) === "important",
   }));
 }
 
-function uniqueSelector(element: Element): string {
+export function uniqueSelector(element: Element): string {
   const root = element.getRootNode() as Document | ShadowRoot;
   const parts: string[] = [];
   let current: Element | null = element;
@@ -37,29 +39,23 @@ function uniqueSelector(element: Element): string {
   return parts.join(" > ");
 }
 
-function isPassword(element: Element): boolean {
-  return (
-    element.localName === "input" &&
-    element.getAttribute("type")?.toLowerCase() === "password"
-  );
+export function parentOf(element: Element): Element | null {
+  const root = element.getRootNode();
+  return element.parentElement || (root instanceof ShadowRoot ? root.host : null);
 }
 
-function safeHTML(element: Element): string {
-  const clone = element.cloneNode(true) as Element;
-  for (const input of [clone, ...clone.querySelectorAll("input")]) {
-    if (isPassword(input)) input.setAttribute("value", "[redacted]");
-  }
-  return clone.outerHTML;
-}
+const inheritedProperty = (name: string) => name.startsWith("--") ||
+  /^(color$|font($|-)|line-height$|letter-spacing$|word-spacing$|text-align$|text-indent$|text-transform$|white-space$|visibility$|cursor$|direction$|writing-mode$|list-style($|-)|border-collapse$|border-spacing$|orphans$|widows$|quotes$)/.test(name);
 
-function sourceRules(element: Element) {
+function sourceRules(element: Element, ancestors: Element[]) {
   const rules: SourceRule[] = [];
   const inaccessible = new Set<string>();
   const notes = new Set<string>();
-  const root = element.getRootNode() as Document | ShadowRoot;
-  const sheets = [...root.styleSheets, ...root.adoptedStyleSheets];
+  const targets = [element, ...ancestors];
+  const matched = new Map(targets.map((target) => [target, [] as SourceRule[]]));
   const visited = new Set<CSSStyleSheet>();
   let examined = 0;
+  let currentRoot: Document | ShadowRoot;
   function walk(
     list: CSSRuleList,
     origin: string,
@@ -73,6 +69,7 @@ function sourceRules(element: Element) {
         );
         return;
       }
+      if (rule.constructor.name === "CSSPropertyRule") notes.add("@property registration may change CSS variable inheritance.");
       if (rule instanceof CSSImportRule) {
         if (rule.media.length && !matchMedia(rule.media.mediaText).matches)
           continue;
@@ -97,13 +94,16 @@ function sourceRules(element: Element) {
           continue;
         }
         try {
-          if (element.matches(rule.selectorText))
-            rules.push({
+          for (const target of targets) {
+            if (target.getRootNode() !== currentRoot || !target.matches(rule.selectorText)) continue;
+            const items = declarations(rule.style).filter((item) => target === element || inheritedProperty(item.property));
+            if (items.length) matched.get(target)!.push({
               selector: rule.selectorText,
               origin,
               context,
-              declarations: declarations(rule.style),
+              declarations: items,
             });
+          }
         } catch {
           notes.add("Some selectors could not be evaluated by the browser.");
         }
@@ -147,29 +147,52 @@ function sourceRules(element: Element) {
       inaccessible.add(origin);
     }
   }
-  sheets.forEach((stylesheet) => sheet(stylesheet));
+  for (const root of new Set(targets.map((target) => target.getRootNode() as Document | ShadowRoot))) {
+    currentRoot = root;
+    visited.clear();
+    [...root.styleSheets, ...root.adoptedStyleSheets].forEach((stylesheet) => sheet(stylesheet));
+  }
+  rules.push(...matched.get(element)!);
+  const inherited = ancestors.map((ancestor) => ({
+    element: uniqueSelector(ancestor),
+    inline: "style" in ancestor ? declarations((ancestor as HTMLElement).style).filter((item) => inheritedProperty(item.property)) : [],
+    rules: matched.get(ancestor)!,
+  })).filter((entry) => entry.inline.length || entry.rules.length);
   if (element.closest("iframe, frame"))
     notes.add(
       "Frame contents are isolated. This inspection describes the frame element only.",
     );
-  return { rules, inaccessible: [...inaccessible], notes: [...notes] };
+  return { rules, inherited, inaccessible: [...inaccessible], notes: [...notes] };
 }
 
-export function capture(element: Element): Inspection {
+export function capture(element: Element, link: (element: Element) => ElementLink): Inspection {
   const computed = getComputedStyle(element);
   const rect = element.getBoundingClientRect();
-  const html = safeHTML(element);
+  const safe = sanitizedElement(element);
+  if (element.parentElement?.closest("[contenteditable]:not([contenteditable=false]), textarea, select")) {
+    safe.textContent = "[redacted]";
+    if (safe.hasAttribute("value")) safe.setAttribute("value", "[redacted]");
+  }
+  const html = safe.outerHTML;
   const root = element.getRootNode();
-  return {
+  const ancestors: Element[] = [];
+  for (let parent = parentOf(element); parent; parent = parentOf(parent)) ancestors.push(parent);
+  const source = sourceRules(element, ancestors.slice(0, 20));
+  if (ancestors.length > 20) source.notes.push("Inherited source rules are limited to the nearest 20 ancestors.");
+  const inline = "style" in element ? declarations((element as HTMLElement | SVGElement).style) : [];
+  classifyDeclarations(element, inline, source.rules, !source.inaccessible.length && !source.notes.length && !(root instanceof ShadowRoot));
+  source.notes.push("Active/overridden labels describe accessible author declarations for simple selectors. Unknown covers incomplete sources, layers, advanced selectors, logical/physical property conflicts, partial shorthand overrides, animations and transitions. Browser/user styles, pseudo-elements and shadow boundary cascade are not resolved.");
+  source.notes.push("Inherited entries are ancestor declarations for common inherited properties and variables, not proof of inheritance; explicit inherit, @property and resets can change the result. Computed contains final values.");
+  const children = [...element.children, ...(element.shadowRoot?.children || [])].filter((child) => !child.hasAttribute("data-layr-overlay"));
+  if (children.length > 100) source.notes.push("Child navigation shows the first 100 elements. Select a child to continue exploring.");
+  return redactInspection({
     tag: element.localName,
-    text: (element.textContent ?? "").trim().slice(0, 2000),
+    text: (safe.textContent ?? "").trim().slice(0, 2000),
     id: element.id,
     classes: Array.from(element.classList),
-    attributes: Array.from(element.attributes, (attr) => [
+    attributes: Array.from(safe.attributes, (attr): [string, string] => [
       attr.name,
-      isPassword(element) && attr.name.toLowerCase() === "value"
-        ? "[redacted]"
-        : attr.value,
+      attr.value,
     ]),
     html: html.slice(0, 60000),
     htmlTruncated: html.length > 60000,
@@ -184,12 +207,11 @@ export function capture(element: Element): Inspection {
         computed.getPropertyValue(property).trim(),
       ]),
     ),
-    inline:
-      "style" in element
-        ? declarations((element as HTMLElement | SVGElement).style)
-        : [],
-    ...sourceRules(element),
+    inline,
+    ...source,
+    breadcrumb: [...ancestors].reverse().concat(element).map(link),
+    children: children.slice(0, 100).map(link),
     rect: { width: rect.width, height: rect.height, x: rect.x, y: rect.y },
     capturedAt: new Date().toISOString(),
-  };
+  }, sensitiveValues(element));
 }

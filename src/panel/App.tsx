@@ -11,13 +11,15 @@ import {
   Layers2,
   LockKeyhole,
   MousePointer2,
+  Moon,
   RefreshCw,
   ScanLine,
   Search,
+  Sun,
   X,
 } from "lucide-react";
 import { computedCSS, cssDeclarations, inspectionText } from "../shared/format";
-import type { Inspection } from "../shared/types";
+import type { Declaration, Inspection } from "../shared/types";
 import {
   CodeBlock,
   CopyButton,
@@ -26,6 +28,7 @@ import {
   type CopyHandler,
 } from "./components";
 import { useInspector } from "./useInspector";
+import { useTheme } from "./useTheme";
 
 type Tab = "Overview" | "Styles" | "Layout" | "Source";
 const tabs: { name: Tab; icon: typeof Code2 }[] = [
@@ -190,6 +193,15 @@ function Styles({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
 function BoxModel({ data }: { data: Inspection }) {
   const value = (name: string) =>
     data.computed[name]?.replace(/px$/, "") ?? "0";
+  const contentSize = (axis: "width" | "height") => {
+    const size = data.computed[axis];
+    if (!size?.endsWith("px") || data.computed["box-sizing"] !== "border-box") return value(axis);
+    const sides = axis === "width" ? ["left", "right"] : ["top", "bottom"];
+    const edges = sides.reduce((sum, side) => sum +
+      (parseFloat(data.computed[`padding-${side}`]) || 0) +
+      (parseFloat(data.computed[`border-${side}-width`]) || 0), 0);
+    return number(Math.max(0, parseFloat(size) - edges));
+  };
   const sides = (prefix: string, suffix = "") => (
     <>
       <span className="side top">{value(`${prefix}-top${suffix}`)}</span>
@@ -199,7 +211,7 @@ function BoxModel({ data }: { data: Inspection }) {
     </>
   );
   return (
-    <div className="box-model">
+    <div className="box-model" role="img" aria-label="CSS box model: margin, border, padding, and content dimensions">
       <div className="box-margin">
         <span className="box-label">margin</span>
         {sides("margin")}
@@ -210,9 +222,9 @@ function BoxModel({ data }: { data: Inspection }) {
             <span className="box-label">padding</span>
             {sides("padding")}
             <div className="box-content">
-              {value("width")}
+              {contentSize("width")}
               <span>×</span>
-              {value("height")}
+              {contentSize("height")}
             </div>
           </div>
         </div>
@@ -228,7 +240,7 @@ function Layout({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
     <>
       <Section title="Box model">
         <BoxModel data={data} />
-        <p className="hint">CSS dimensions in px. Center follows box-sizing.</p>
+        <p className="hint">CSS dimensions in px. Center shows the content box; borders and padding are subtracted for border-box sizing. Transforms are excluded.</p>
       </Section>
       <Section title="Dimensions">
         <Properties
@@ -314,15 +326,17 @@ function Source({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
       <div className="source-note">
         <Code2 size={15} />
         <p>
-          Declared CSS that directly matches this element. Rule order here does
-          not identify cascade winners. Final values are in{" "}
-          <strong>Styles</strong>.
+          Matching source rules are separate from <strong>Styles</strong>, which
+          shows final computed values. Status labels apply to accessible author
+          declarations where the cascade can be resolved. Unknown means there
+          is insufficient information.
         </p>
       </div>
       <Section title="Inline style" count={data.inline.length}>
         {data.inline.length ? (
-          <CodeBlock
-            text={`element.style {\n${cssDeclarations(data.inline)}\n}`}
+          <SourceDeclarations
+            selector="element.style"
+            items={data.inline}
             label="Copy inline CSS"
             onCopy={onCopy}
           />
@@ -341,8 +355,9 @@ function Source({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
               {rule.context.length > 0 && (
                 <div className="rule-context">{rule.context.join(" → ")}</div>
               )}
-              <CodeBlock
-                text={`${rule.selector} {\n${cssDeclarations(rule.declarations)}\n}`}
+              <SourceDeclarations
+                selector={rule.selector}
+                items={rule.declarations}
                 label="Copy CSS rule"
                 onCopy={onCopy}
               />
@@ -353,6 +368,22 @@ function Source({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
             No accessible rules directly match this element.
           </p>
         )}
+      </Section>
+      <Section title="Inherited styles" count={data.inherited.length}>
+        <p className="hint">Common inherited properties and CSS variables declared on ancestors, nearest first. These are candidates; the selected element may override them.</p>
+        {data.inherited.map((ancestor, index) => (
+          <div className="source-rule" key={index}>
+            <p className="rule-context">From {ancestor.element}</p>
+            {ancestor.inline.length > 0 && <CodeBlock text={`element.style {\n${cssDeclarations(ancestor.inline)}\n}`} label="Copy inherited inline CSS" onCopy={onCopy} />}
+            {ancestor.rules.map((rule, index) => (
+              <div key={index}>
+                <p className="hint">{rule.origin} {rule.context.join(" → ")}</p>
+                <CodeBlock text={`${rule.selector} {\n${cssDeclarations(rule.declarations)}\n}`} label="Copy inherited CSS rule" onCopy={onCopy} />
+              </div>
+            ))}
+          </div>
+        ))}
+        {!data.inherited.length && <p className="hint">No accessible ancestor declarations found.</p>}
       </Section>
       {data.inaccessible.length > 0 && (
         <Section
@@ -373,9 +404,9 @@ function Source({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
       )}
       <Section title="Source coverage" open={false}>
         <p className="hint">
-          Inherited ancestor rules, pseudo-elements, and browser default
-          declarations are not listed. Inactive media and support queries are
-          excluded.
+          Pseudo-elements and browser default declarations are not listed.
+          Inactive media and support queries are excluded. Final inherited
+          values and CSS variables appear in Styles.
         </p>
         {data.notes.map((note) => (
           <p className="hint" key={note}>
@@ -387,7 +418,31 @@ function Source({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
   );
 }
 
+function SourceDeclarations({ selector, items, label, onCopy }: {
+  selector: string;
+  items: Declaration[];
+  label: string;
+  onCopy: CopyHandler;
+}) {
+  return (
+    <div className="code-block source-code">
+      <CopyButton text={`${selector} {\n${cssDeclarations(items)}\n}`} label={label} onCopy={onCopy} />
+      <code className="source-selector">{selector} {"{"}</code>
+      <div className="declaration-statuses">
+        {items.map((item) => (
+          <div className={`declaration-status ${item.status || "unknown"}`} key={item.property}>
+            <code>{item.property}: {item.value}{item.important ? " !important" : ""};</code>
+            <span>{item.status || "unknown"}</span>
+          </div>
+        ))}
+      </div>
+      <code>{"}"}</code>
+    </div>
+  );
+}
+
 export function App() {
+  const { theme, toggleTheme } = useTheme();
   const { enabled, inspection, tab, error, busy, run } = useInspector();
   const [active, setActive] = useState<Tab>("Overview");
   const [notice, setNotice] = useState("");
@@ -441,24 +496,34 @@ export function App() {
             <span className="tagline">Look beyond the pixels.</span>
           </div>
         </div>
-        <div className="power">
-          <span className={enabled ? "power-label on" : "power-label"}>
-            {enabled ? "ON" : "OFF"}
-          </span>
+        <div className="header-actions">
           <button
-            className={`toggle ${enabled ? "enabled" : ""}`}
-            role="switch"
-            aria-label="Inspection mode"
-            aria-checked={enabled}
-            aria-describedby={error ? "page-access-help" : undefined}
-            title={
-              error || (enabled ? "Turn inspection off" : "Turn inspection on")
-            }
-            disabled={busy || !tab}
-            onClick={() => void run({ type: "LAYR_ENABLE", enabled: !enabled })}
+            className="icon-button theme-toggle"
+            aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            onClick={toggleTheme}
           >
-            <span />
+            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
           </button>
+          <div className="power">
+            <span className={enabled ? "power-label on" : "power-label"}>
+              {enabled ? "ON" : "OFF"}
+            </span>
+            <button
+              className={`toggle ${enabled ? "enabled" : ""}`}
+              role="switch"
+              aria-label="Inspection mode"
+              aria-checked={enabled}
+              aria-describedby={error ? "page-access-help" : undefined}
+              title={
+                error || (enabled ? "Turn inspection off" : "Turn inspection on")
+              }
+              disabled={busy || !tab}
+              onClick={() => void run({ type: "LAYR_ENABLE", enabled: !enabled })}
+            >
+              <span />
+            </button>
+          </div>
         </div>
       </header>
       <div className="connection">
@@ -539,6 +604,26 @@ export function App() {
             </div>
           </div>
           <main className="inspector-content">
+            <Section title="DOM navigation">
+              <nav className="breadcrumbs" aria-label="DOM breadcrumb path">
+                {inspection.breadcrumb.map((item, index) => (
+                  <button key={item.key} disabled={busy || index === inspection.breadcrumb.length - 1}
+                    aria-current={index === inspection.breadcrumb.length - 1 ? "location" : undefined}
+                    onClick={() => void run({ type: "LAYR_NAVIGATE", key: item.key })}>
+                    {item.label}
+                  </button>
+                ))}
+              </nav>
+              <button className="filter" disabled={busy || inspection.breadcrumb.length < 2}
+                onClick={() => void run({ type: "LAYR_NAVIGATE", key: inspection.breadcrumb.at(-2)!.key })}>Select parent</button>
+              <details className="children-navigation">
+                <summary>Child elements ({inspection.children.length})</summary>
+                <div className="child-list">{inspection.children.map((item) => (
+                  <button className="filter" key={item.key} disabled={busy}
+                    onClick={() => void run({ type: "LAYR_NAVIGATE", key: item.key })}>{item.label}</button>
+                ))}</div>
+              </details>
+            </Section>
             {active === "Overview" && (
               <Overview data={inspection} onCopy={onCopy} />
             )}
@@ -561,7 +646,10 @@ export function App() {
               <span>Copy inspection</span>
               <ArrowUpRight size={14} />
             </button>
-            <span>Ready for your next prompt.</span>
+            <button className="primary-button ai-copy" onClick={() => void onCopy(inspectionText(inspection))}>
+              <Code2 size={15} /><span>Copy for AI</span>
+            </button>
+            <span>Redacted details. Clipboard only. Review before sharing.</span>
           </div>
         </>
       ) : (

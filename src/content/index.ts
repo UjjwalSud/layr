@@ -1,4 +1,5 @@
 import { capture } from "./capture";
+import { hoverDescription, redactText } from "./privacy";
 import type { ContentCommand, InspectorState } from "../shared/types";
 
 // Injection is idempotent, including concurrent toolbar / panel activation.
@@ -14,8 +15,14 @@ if (!global.__layrInstalled) {
   let selectionBox: HTMLDivElement;
   let button: HTMLButtonElement;
   let label: HTMLSpanElement;
+  let shields: HTMLDivElement;
+  const navigation = new Map<number, Element>();
+  let nextKey = 0;
   let controller: AbortController | null = null;
   let observer: ResizeObserver | null = null;
+  let mutations: MutationObserver | null = null;
+  let frames: Element[] = [];
+  let framesDirty = true;
   let frame = 0;
   let point: { x: number; y: number } | null = null;
   let buttonBounds: { left: number; top: number; width: number } | null = null;
@@ -45,12 +52,13 @@ if (!global.__layrInstalled) {
     const shadow = host.attachShadow({ mode: "open" });
     shadow.innerHTML = `<style>
       :host{color-scheme:dark}*{box-sizing:border-box}
-      .surface{position:fixed;inset:0;pointer-events:auto;cursor:crosshair}
+      .frame-shield{position:fixed;pointer-events:auto;cursor:crosshair}
       .box{position:fixed;pointer-events:none;border:1px solid #478bff;background:#478bff0a;display:none;z-index:1}
       .selected{border-color:#80abff;box-shadow:0 0 0 1px #478bff55;background:transparent}
-      button{all:initial;box-sizing:border-box;position:fixed;display:none;align-items:center;gap:6px;height:29px;padding:0 8px;background:#3478f6;color:white;border:1px solid #8eb7ff;border-radius:6px;box-shadow:0 3px 12px #0004;cursor:pointer;pointer-events:auto;z-index:2;font:11px/1.2 ui-monospace,monospace;white-space:nowrap;max-width:calc(100vw - 8px);overflow:hidden}
-      button:focus-visible{outline:2px solid white;outline-offset:2px}svg{flex:none}span{overflow:hidden;text-overflow:ellipsis}
-    </style><div class="surface"></div><div class="box selected"></div><div class="box hover"></div><button type="button" title="Inspect element with Layr" aria-label="Inspect element with Layr"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 9V4h5m6 0h5v5M4 15v5h5m11-5v5h-5M9 9l8 3-4 1-1 4z"/></svg><span></span></button>`;
+      button{all:initial;box-sizing:border-box;position:fixed;display:none;align-items:center;justify-content:center;width:29px;height:29px;background:#3478f6;color:white;border:1px solid #8eb7ff;border-radius:6px;box-shadow:0 3px 12px #0004;cursor:pointer;pointer-events:auto;z-index:2;font:11px/1.2 ui-monospace,monospace;white-space:nowrap}
+      button:focus-visible{outline:2px solid white;outline-offset:2px}svg{flex:none}span{position:fixed;pointer-events:none;overflow:hidden;text-overflow:ellipsis;width:max-content;max-width:min(390px,calc(100vw - 45px));padding:7px 8px;background:#111b2f;color:#dbe8ff;border:1px solid #478bff;border-radius:5px;box-sizing:border-box;height:29px;font:11px/1.2 ui-monospace,monospace}
+    </style><div class="shields"></div><div class="box selected"></div><div class="box hover"></div><button type="button" title="Inspect element with Layr" aria-label="Inspect element with Layr"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 9V4h5m6 0h5v5M4 15v5h5m11-5v5h-5M9 9l8 3-4 1-1 4z"/></svg><span></span></button>`;
+    shields = shadow.querySelector(".shields")!;
     selectionBox = shadow.querySelector(".selected")!;
     hoverBox = shadow.querySelector(".hover")!;
     button = shadow.querySelector("button")!;
@@ -76,7 +84,7 @@ if (!global.__layrInstalled) {
   }
 
   function atPoint(x: number, y: number): Element | null {
-    // The reusable surface also shields frame documents from accidental clicks.
+    // Only frame documents need shields; the page itself receives normal hover.
     let element =
       document
         .elementsFromPoint(x, y)
@@ -101,9 +109,11 @@ if (!global.__layrInstalled) {
   function draw() {
     frame = 0;
     if (!enabled) return;
+    updateFrameShields();
     if (selected && !selected.isConnected) {
       selected = null;
       inspection = null;
+      navigation.clear();
       publish();
     }
     positionBox(selectionBox, selected);
@@ -117,7 +127,7 @@ if (!global.__layrInstalled) {
       buttonBounds = null;
       return;
     }
-    label.textContent = `${hovered.localName}${hovered.id ? `#${hovered.id}` : ""}`;
+    label.textContent = hoverDescription(hovered);
     button.style.display = "flex";
     const width = button.getBoundingClientRect().width;
     const left = Math.max(4, Math.min(rect.left, innerWidth - width - 4));
@@ -128,7 +138,40 @@ if (!global.__layrInstalled) {
         : Math.min(rect.bottom + 5, innerHeight - 33);
     const top = Math.max(4, desiredTop);
     button.style.top = `${top}px`;
+    const labelWidth = label.getBoundingClientRect().width;
+    let labelLeft = left + width + 4;
+    let labelTop = top;
+    if (labelLeft + labelWidth > innerWidth - 4) {
+      labelLeft = Math.max(4, left - labelWidth - 4);
+      if (labelLeft + labelWidth > left - 4)
+        labelTop = top + 62 <= innerHeight ? top + 33 : Math.max(4, top - 33);
+    }
+    label.style.left = `${labelLeft}px`;
+    label.style.top = `${labelTop}px`;
     buttonBounds = { left, top, width };
+  }
+  function updateFrameShields() {
+    // Frame events cannot be intercepted by listeners in the parent document.
+    if (framesDirty) {
+      framesDirty = false;
+      frames = [];
+      mutations?.disconnect();
+      const find = (root: Document | ShadowRoot) => {
+        frames.push(...root.querySelectorAll("iframe, frame"));
+        mutations?.observe(root, { childList: true, subtree: true, attributes: true });
+        for (const node of root.querySelectorAll("*")) {
+          if (node !== host && node.shadowRoot) find(node.shadowRoot);
+        }
+      };
+      find(document);
+    }
+    while (shields.children.length < frames.length) {
+      const shield = document.createElement("div");
+      shield.className = "frame-shield";
+      shields.append(shield);
+    }
+    while (shields.children.length > frames.length) shields.lastElementChild?.remove();
+    frames.forEach((element, index) => positionBox(shields.children[index] as HTMLElement, element));
   }
   const schedule = () => {
     if (!frame) frame = requestAnimationFrame(draw);
@@ -136,13 +179,19 @@ if (!global.__layrInstalled) {
   function clear() {
     selected = null;
     inspection = null;
+    navigation.clear();
     observer?.disconnect();
     publish();
     schedule();
   }
   function select(element: Element) {
     selected = element;
-    inspection = capture(element);
+    navigation.clear();
+    inspection = capture(element, (target) => {
+      const key = ++nextKey;
+      navigation.set(key, target);
+      return { key, label: redactText(`${target.localName}${target.id ? `#${target.id}` : ""}${Array.from(target.classList).slice(0, 2).map((name) => `.${name}`).join("")}`).slice(0, 160) };
+    });
     observer?.disconnect();
     observer?.observe(element);
     publish();
@@ -157,6 +206,10 @@ if (!global.__layrInstalled) {
       controller = null;
       observer?.disconnect();
       observer = null;
+      mutations?.disconnect();
+      mutations = null;
+      frames = [];
+      framesDirty = true;
       cancelAnimationFrame(frame);
       frame = 0;
       host?.remove();
@@ -164,6 +217,7 @@ if (!global.__layrInstalled) {
       selected = null;
       hovered = null;
       inspection = null;
+      navigation.clear();
       point = null;
       buttonBounds = null;
       publish();
@@ -173,6 +227,12 @@ if (!global.__layrInstalled) {
     controller = new AbortController();
     const options = { capture: true, signal: controller.signal };
     observer = new ResizeObserver(schedule);
+    mutations = new MutationObserver((records) => {
+      if (!records.some((record) => !(record.target instanceof Element) || !ownElement(record.target))) return;
+      framesDirty = records.some((record) => record.type === "childList") || framesDirty;
+      schedule();
+    });
+    updateFrameShields();
     window.addEventListener(
       "pointermove",
       (event) => {
@@ -200,6 +260,7 @@ if (!global.__layrInstalled) {
       "dblclick",
       "auxclick",
       "contextmenu",
+      "dragstart",
     ]) {
       window.addEventListener(
         type,
@@ -231,15 +292,23 @@ if (!global.__layrInstalled) {
         ) {
           stop(event);
           if (hovered) select(hovered);
+        } else if (event.key === "Enter" || event.key === " ") {
+          // A previously focused link/button must not activate during selection.
+          stop(event);
+          if (event.target instanceof Element && !ownElement(event.target)) select(event.target);
         }
       },
       options,
     );
+    window.addEventListener("keyup", (event) => {
+      if (event.key === "Enter" || event.key === " ") stop(event);
+    }, options);
     window.addEventListener(
       "scroll",
       () => {
         hovered = null;
         point = null;
+        updateFrameShields();
         schedule();
       },
       { ...options, passive: true },
@@ -295,6 +364,16 @@ if (!global.__layrInstalled) {
           else if (enabled) clear();
           respond(state());
           break;
+        case "LAYR_NAVIGATE": {
+          const target = navigation.get(message.key);
+          if (enabled && target?.isConnected) {
+            target.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+            select(target);
+          } else if (enabled && selected?.isConnected) select(selected);
+          else if (enabled) clear();
+          respond(state());
+          break;
+        }
       }
     },
   );

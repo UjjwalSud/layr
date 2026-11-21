@@ -24,8 +24,17 @@ test("production manifest uses only the three required permissions and local ass
     manifest.side_panel.default_path,
     "content.js",
     ...Object.values(manifest.icons),
+    ...Object.values(manifest.action.default_icon),
+    "icons/layr.svg",
+    "icons/icon-256.png",
+    "icons/icon-512.png",
   ]) {
     assert.ok((await readFile(path.join(dist, file))).length > 0, file);
+  }
+  for (const size of [16, 32, 48, 128, 256, 512]) {
+    const png = await readFile(path.join(dist, `icons/icon-${size}.png`));
+    assert.equal(png.readUInt32BE(16), size);
+    assert.equal(png.readUInt32BE(20), size);
   }
   assert.doesNotMatch(
     await readFile(path.join(dist, "content.js"), "utf8"),
@@ -38,12 +47,31 @@ test(
   { timeout: 120000 },
   async (t) => {
     const errors = [];
+    const imageRequests = [];
     const folder = await mkdtemp(path.join(tmpdir(), "layr-test-"));
     const extension = dist;
     const server = createServer((request, response) => {
+      if (request.url.startsWith("/pixel.png")) {
+        imageRequests.push(request.url);
+        response.setHeader("Content-Type", "image/png");
+        response.end(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7XsAAAAASUVORK5CYII=", "base64"));
+        return;
+      }
       if (request.url === "/foreign.css") {
         response.setHeader("Content-Type", "text/css");
         response.end(".target { background-color: rgb(31, 41, 61); }");
+        return;
+      }
+      if (request.url === "/cascade") {
+        response.setHeader("Content-Type", "text/html");
+        response.end(`<!doctype html><style>
+          body { padding:80px; color:rgb(11, 22, 33); --inherited:18px; }
+          .cascade { font-size:12px; margin:12px; padding:20px; color:red; letter-spacing:1px !important; }
+          .cascade { font-size:20px; margin-left:24px; color:blue; }
+          #cascade { color:green; letter-spacing:2px; }
+          .cascade:hover { background-color:rgb(1, 2, 3); }
+        </style><section id="parent"><button class="cascade" id="cascade" style="color:purple; font-weight:600; letter-spacing:3px">Cascade child</button></section>
+        <script>window.pageClicks=0; document.addEventListener('click', () => window.pageClicks++);</script>`);
         return;
       }
       response.setHeader("Content-Type", "text/html");
@@ -59,6 +87,7 @@ test(
         @layer fixture { .target { letter-spacing:1px; } }
         @container (min-width: 1px) { .target { opacity:.5; } }
         .target { &:hover { text-decoration: underline; } }
+        .target:hover { outline:3px solid rgb(255, 200, 10); }
         #password-wrap { margin-top:60px; padding:20px; border:1px solid #555; }
         svg { margin-top:35px; }
       </style></head><body>
@@ -69,10 +98,18 @@ test(
       <svg id="vector" width="100" height="60"><rect id="shape" width="80" height="50" fill="#80adff" /></svg>
       <div id="shadow-host" style="margin-top:30px"></div>
       <iframe id="frame" srcdoc="<button>Inside frame</button>" title="fixture frame"></iframe>
+      <div id="private-info" data-token="fixture-private-token" style="padding:12px; --access-token: css-secret">
+        <input id="email" value="private@example.com"><input type="hidden" value="hidden-secret">
+        <textarea>textarea-secret</textarea><div contenteditable="true"><span>editable-secret</span></div>
+        <a href="https://alice:credentials@example.test/path?auth=link-secret#state=fragment-secret" onclick="console.log('event-secret')">private@example.com fixture-private-token</a>
+        <script type="application/json">{"credential":"script-secret"}</script>
+        <img src="/pixel.png?token=image-secret" alt="fixture image" width="16" height="16">
+      </div>
       <script>
-        window.pageClicks=0; window.pagePointerDowns=0;
+        window.pageClicks=0; window.pagePointerDowns=0; window.pageHovers=0;
         document.addEventListener('click', () => window.pageClicks++);
         document.addEventListener('pointerdown', () => window.pagePointerDowns++);
+        document.getElementById('target').addEventListener('pointerover', () => window.pageHovers++);
         document.getElementById('live-password').value='runtime-secret';
         const root=document.getElementById('shadow-host').attachShadow({mode:'open'});
         root.innerHTML='<style>button{color:rgb(255, 100, 100)}</style><button id="shadow-button">Shadow button</button>';
@@ -145,7 +182,7 @@ test(
       }
       const last = await get();
       assert.fail(
-        `Timed out waiting for inspector state; last selection: ${last.inspection?.tag}#${last.inspection?.id}`,
+        `Timed out waiting for inspector state; last selection: ${last.inspection?.tag}#${last.inspection?.id}; errors: ${errors.join("; ")}`,
       );
     };
 
@@ -185,6 +222,8 @@ test(
       name: "Inspect element with Layr",
     });
     await icon.waitFor({ state: "visible" });
+    assert.ok(await page.evaluate(() => window.pageHovers > 0), "page pointer hover listeners still run");
+    assert.equal(await page.locator("#target").evaluate((element) => getComputedStyle(element).outlineStyle), "solid", "native CSS :hover still works");
     const targetBox = await page.locator("#target").boundingBox();
     const iconBox = await icon.boundingBox();
     assert.match(
@@ -192,6 +231,10 @@ test(
       /button#target/,
       JSON.stringify({ targetBox, iconBox }),
     );
+    assert.match(await icon.innerText(), /\.target\.alpha/);
+    assert.match(await icon.innerText(), /240 × \d+/);
+    assert.match(await icon.innerText(), /Inspect this button/);
+    assert.equal(await icon.locator("span").evaluate((element) => getComputedStyle(element).pointerEvents), "none", "hover label does not intercept page events");
     await page.mouse.move(iconBox.x + 5, targetBox.y + 2);
     await page.mouse.move(iconBox.x + 5, iconBox.y + iconBox.height / 2, {
       steps: 12,
@@ -209,6 +252,9 @@ test(
     assert.equal(state.inspection.computed["--fixture-accent"], "#80adff");
     assert.equal(state.inspection.selector, "#target");
     assert.equal(state.inspection.rect.width, 240);
+    assert.equal(state.inspection.breadcrumb.at(-1).label, "button#target.target.alpha");
+    assert.ok(state.inspection.inherited.some((entry) => entry.rules.some((rule) => rule.declarations.some((item) => item.property === "--fixture-accent"))));
+    assert.ok(state.inspection.rules.every((rule) => rule.declarations.every((item) => item.status === "unknown")), "incomplete CSSOM is never presented as a resolved cascade");
     assert.ok(
       state.inspection.inline.some(
         (item) => item.property === "font-weight" && item.value === "600",
@@ -258,6 +304,16 @@ test(
       JSON.stringify(state),
       /attribute-secret|runtime-secret/,
     );
+    await page.locator("#private-info").scrollIntoViewIfNeeded();
+    await page.locator("#private-info").click({ force: true, position: { x: 2, y: 2 } });
+    state = await waitFor((state) => state.inspection?.id === "private-info");
+    assert.doesNotMatch(JSON.stringify(state), /private@example\.com|fixture-private-token|hidden-secret|textarea-secret|editable-secret|link-secret|fragment-secret|script-secret|event-secret|credentials|css-secret/);
+    assert.ok(!JSON.stringify(state).includes("image-secret"));
+    assert.equal(imageRequests.length, 1, "sanitizing HTML never loads cloned or redacted image URLs");
+    const removedKey = state.inspection.children[0].key;
+    await page.locator("#email").evaluate((element) => element.remove());
+    state = await send({ type: "LAYR_NAVIGATE", key: removedKey });
+    assert.equal(state.inspection.id, "private-info", "detached navigation targets refresh safely");
 
     await page.locator("#duplicates span").nth(1).click({ force: true });
     state = await waitFor((state) => state.inspection?.text === "Second");
@@ -278,6 +334,9 @@ test(
     assert.ok(
       state.inspection.rules.some((rule) => rule.selector === "button"),
     );
+    state = await send({ type: "LAYR_NAVIGATE", key: state.inspection.breadcrumb.at(-2).key });
+    assert.equal(state.inspection.id, "shadow-host", "parent navigation crosses an open shadow root");
+    assert.ok(state.inspection.children.some((child) => child.label === "button#shadow-button"));
     await page.locator("#frame").click({ force: true });
     state = await waitFor((state) => state.inspection?.id === "frame");
     assert.ok(
@@ -293,6 +352,8 @@ test(
     await panel.goto(`chrome-extension://${id}/sidepanel.html`);
     await page.bringToFront();
     await panel.getByText("SELECTED ELEMENT").waitFor();
+    await panel.getByRole("button", { name: "Switch to light mode", exact: true }).click();
+    assert.equal(await panel.locator("html").getAttribute("data-theme"), "light");
     assert.equal(
       await panel
         .getByRole("switch", { name: "Inspection mode" })
@@ -319,9 +380,19 @@ test(
       .getByRole("button", { name: "Layout", exact: true })
       .click();
     await panel.locator(".box-model").waitFor();
+    assert.match(await panel.locator(".box-content").innerText(), /196/, "border-box dimensions are converted to content-box dimensions");
     await panel.getByRole("button", { name: "Source", exact: true }).click();
     await panel.getByText("Unreadable stylesheets", { exact: true }).waitFor();
     await panel.getByRole("button", { name: "Overview", exact: true }).click();
+    await panel.getByRole("button", { name: "Select parent", exact: true }).click();
+    await waitFor((state) => state.inspection?.tag === "body");
+    await panel.locator(".children-navigation summary").click();
+    await panel.locator(".child-list").getByRole("button", { name: "button#target.target.alpha", exact: true }).click();
+    await waitFor((state) => state.inspection?.id === "target");
+    await panel.getByRole("navigation", { name: "DOM breadcrumb path" }).getByRole("button", { name: "body", exact: true }).click();
+    await waitFor((state) => state.inspection?.tag === "body");
+    await page.locator("#target").click({ force: true });
+    await panel.locator(".selected-name").filter({ hasText: "button#target" }).waitFor();
     const panelCdp = await context.newCDPSession(panel);
     await panelCdp.send("Emulation.setFocusEmulationEnabled", {
       enabled: true,
@@ -341,6 +412,16 @@ test(
     assert.match(report, /# Layr inspection/);
     assert.match(report, /Computed CSS/);
     assert.match(report, /Unreadable stylesheet/);
+    await panel.getByRole("button", { name: "Copy for AI", exact: true }).click();
+    const aiReport = await panel.evaluate(() => navigator.clipboard.readText());
+    for (const expected of [/Tag: button/, /Classes: target alpha/, /Inspect this button/, /## HTML/, /## Layout/, /## Computed CSS/, /## Matching source CSS/, /## Inherited source candidates/, /## DOM path/]) assert.match(aiReport, expected);
+    assert.equal(await panel.locator(".brand img").getAttribute("src"), "/icons/layr.svg");
+    await page.locator("#private-info").click({ force: true, position: { x: 2, y: 2 } });
+    await panel.locator(".selected-name").filter({ hasText: "div#private-info" }).waitFor();
+    await panel.getByRole("button", { name: "Copy for AI", exact: true }).click();
+    assert.doesNotMatch(await panel.evaluate(() => navigator.clipboard.readText()), /private@example\.com|fixture-private-token|hidden-secret|textarea-secret|editable-secret|link-secret|fragment-secret|script-secret|event-secret|credentials|css-secret/);
+    await page.locator("#target").click({ force: true });
+    await waitFor((state) => state.inspection?.id === "target");
     const other = await context.newPage();
     await other.goto(`http://127.0.0.1:${port}/second`);
     await other.bringToFront();
@@ -378,9 +459,11 @@ test(
     await panel.setViewportSize({ width: 360, height: 900 });
     await mkdir("test-results", { recursive: true });
     await panel.screenshot({
-      path: "test-results/panel-selected.png",
+      path: "test-results/panel-selected-light.png",
       fullPage: true,
     });
+    await panel.getByRole("button", { name: "Switch to dark mode", exact: true }).click();
+    await panel.screenshot({ path: "test-results/panel-selected.png", fullPage: true });
     assert.equal(
       await panel.evaluate(
         () => document.documentElement.scrollWidth <= innerWidth,
@@ -474,6 +557,102 @@ test(
       0,
       "destroying the panel context disconnects and stops inspection",
     );
+
+    // A fully readable sheet exercises conservative, real cascade resolution.
+    await page.goto(`http://127.0.0.1:${port}/cascade`);
+    await page.bringToFront();
+    await browserCdp.send("Extensions.triggerAction", { id, targetId: targetInfo.targetId });
+    await page.locator("[data-layr-overlay]").waitFor({ state: "attached" });
+    await page.locator("#cascade").click({ force: true });
+    state = await waitFor((state) => state.inspection?.id === "cascade");
+    const declarations = state.inspection.rules.flatMap((rule) => rule.declarations);
+    const status = (property, value) => declarations.find((item) => item.property === property && item.value === value)?.status;
+    assert.equal(status("font-size", "12px"), "overridden");
+    assert.equal(status("font-size", "20px"), "active");
+    assert.equal(status("color", "green"), "overridden", "inline styles beat id specificity");
+    assert.equal(state.inspection.inline.find((item) => item.property === "color").status, "active");
+    assert.equal(status("letter-spacing", "1px"), "active", "important stylesheet declaration beats normal inline declaration");
+    assert.equal(state.inspection.inline.find((item) => item.property === "letter-spacing").status, "overridden");
+    assert.equal(status("margin-top", "12px"), "active", "CSSOM expands shorthand into its longhand declarations");
+    assert.equal(status("margin-left", "12px"), "overridden", "only the overridden side of the shorthand is marked");
+    assert.equal(status("margin-left", "24px"), "active");
+    assert.equal(state.inspection.computed.color, "rgb(128, 0, 128)");
+    assert.equal(state.inspection.computed["--inherited"], "18px");
+    await page.locator("#cascade").evaluate((element) => { element.style.marginInlineStart = "10px"; });
+    state = await send({ type: "LAYR_REFRESH" });
+    assert.ok(state.inspection.inline.every((item) => item.status === "unknown"), "logical/physical property conflicts remain unclassified");
+    await page.locator("#cascade").evaluate((element) => { element.style.marginInlineStart = ""; element.style.transitionDuration = "2s"; });
+    state = await send({ type: "LAYR_REFRESH" });
+    assert.ok(state.inspection.inline.every((item) => item.status === "unknown"), "transitions remain unclassified");
+    await page.locator("#cascade").focus();
+    const before = await page.evaluate(() => window.location.href);
+    await page.keyboard.press("Enter");
+    assert.equal(page.url(), before, "keyboard selection never activates focused controls");
+    await page.keyboard.press("Space");
+    assert.equal(await page.evaluate(() => window.pageClicks), 0, "keyboard selection blocks both Enter and Space activation");
     assert.deepEqual(errors, [], "no page or panel runtime errors");
   },
 );
+
+test("browser: panel themes persist locally, sync, and tolerate unavailable storage", { timeout: 60000 }, async (t) => {
+  const folder = await mkdtemp(path.join(tmpdir(), "layr-theme-test-"));
+  const context = await chromium.launchPersistentContext(path.join(folder, "profile"), {
+    channel: "chromium",
+    headless: true,
+    colorScheme: "light",
+    viewport: { width: 360, height: 900 },
+    args: [`--disable-extensions-except=${dist}`, `--load-extension=${dist}`],
+  });
+  t.after(async () => {
+    await context.close();
+    await rm(folder, { recursive: true, force: true });
+  });
+  const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
+  const url = `chrome-extension://${new URL(worker.url()).hostname}/sidepanel.html`;
+  const panel = await context.newPage();
+  const errors = [];
+  panel.on("pageerror", (error) => errors.push(error.message));
+  await panel.goto(url);
+  const lightButton = () => panel.getByRole("button", { name: "Switch to light mode", exact: true });
+  const darkButton = () => panel.getByRole("button", { name: "Switch to dark mode", exact: true });
+  await lightButton().waitFor();
+  assert.equal(await panel.locator("html").getAttribute("data-theme"), "dark", "dark remains the default even on a light system");
+  await lightButton().click();
+  await darkButton().waitFor();
+  assert.equal(await panel.evaluate(() => getComputedStyle(document.documentElement).colorScheme), "light");
+  assert.equal(await panel.evaluate(() => getComputedStyle(document.documentElement).backgroundColor), "rgb(247, 249, 252)");
+  await panel.reload();
+  await darkButton().waitFor();
+  assert.equal(await panel.locator("html").getAttribute("data-theme"), "light", "theme survives reopening the panel");
+  await panel.setViewportSize({ width: 280, height: 900 });
+  const themeBounds = await darkButton().boundingBox();
+  assert.ok(themeBounds.x >= 0 && themeBounds.x + themeBounds.width <= 280, "theme control fits a narrow panel");
+  assert.equal(await panel.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await mkdir("test-results", { recursive: true });
+  await panel.screenshot({ path: "test-results/panel-idle-light.png", fullPage: true });
+
+  const second = await context.newPage();
+  await second.goto(url);
+  await second.getByRole("button", { name: "Switch to dark mode", exact: true }).waitFor();
+  await darkButton().click();
+  await second.getByRole("button", { name: "Switch to light mode", exact: true }).waitFor();
+  assert.equal(await second.locator("html").getAttribute("data-theme"), "dark", "open panels synchronize their preference");
+  await second.close();
+  await panel.reload();
+  await lightButton().waitFor();
+  assert.equal(await panel.evaluate(() => getComputedStyle(document.documentElement).colorScheme), "dark");
+
+  await panel.evaluate(() => localStorage.setItem("layr-theme", "invalid-theme"));
+  await panel.reload();
+  await lightButton().waitFor();
+  assert.equal(await panel.locator("html").getAttribute("data-theme"), "dark", "invalid saved themes fall back safely");
+  await panel.addInitScript(() => {
+    Storage.prototype.getItem = () => { throw new Error("Storage unavailable"); };
+    Storage.prototype.setItem = () => { throw new Error("Storage unavailable"); };
+  });
+  await panel.reload();
+  await lightButton().click();
+  await darkButton().waitFor();
+  assert.equal(await panel.locator("html").getAttribute("data-theme"), "light", "themes still switch when preference storage is unavailable");
+  assert.deepEqual(errors, [], "theme changes cause no runtime errors");
+});

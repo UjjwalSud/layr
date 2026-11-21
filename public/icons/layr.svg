@@ -1,1 +1,21 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="30" fill="#161a25"/><path d="m26 47 38-20 38 20-38 20z" fill="#80adff"/><path d="m26 64 38 20 38-20M26 81l38 20 38-20" fill="none" stroke="#80adff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Layr app icon">
+  <defs>
+    <linearGradient id="electric" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#19a4ff"/>
+      <stop offset="1" stop-color="#087bff"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#18d3ff"/>
+      <stop offset="1" stop-color="#1dbaff"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="29" fill="#071024"/>
+  <g stroke="url(#electric)" fill="none" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M41 24H29A6 6 0 0 0 23 30V43"/>
+    <path d="M87 24H99A6 6 0 0 1 105 30V43"/>
+    <path d="M23 85V99A6 6 0 0 0 29 105H41"/>
+    <path d="M105 85V99A6 6 0 0 1 99 105H87"/>
+    <path d="M34 58L64 41L94 58L64 76Z"/>
+  </g>
+  <path d="M37 81L64 96L91 81" fill="none" stroke="url(#cyan)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
