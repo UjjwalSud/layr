@@ -5,7 +5,7 @@
   "description": "Look beyond the pixels. Inspect HTML, CSS, and layout in a lightweight side panel. Entirely local.",
   "version": "1.0.0",
   "minimum_chrome_version": "116",
-  "permissions": ["activeTab", "scripting", "sidePanel"],
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
   "background": { "service_worker": "background.js", "type": "module" },
   "action": {
     "default_title": "Inspect with Layr",

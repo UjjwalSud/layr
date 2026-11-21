@@ -27,6 +27,7 @@ No complicated tools. No unnecessary steps. Just point, click, and inspect.
 - Search CSS properties.
 - Work without opening Chrome DevTools.
 - Switch between light and dark side-panel themes; your choice stays on this browser.
+- Keep a frozen inspection snapshot while the inspector is OFF or the selected element disappears.
 
 ## Getting Started
 
@@ -67,6 +68,10 @@ On a tab that has not been activated yet, a message below the toggle explains ho
 
 Press **Esc** to clear the selected element. Turn Inspector mode **OFF**, or close the Layr side panel, to stop inspecting and interact with the website normally.
 
+Turning the inspector **OFF** stops hover tracking and removes highlights and floating icons. It keeps the captured snapshot under **Saved inspection**, with **Inspector OFF** shown in the status bar. HTML, CSS, layout, search, and copy actions remain available. **Clear selection** (or **Esc** in the panel) explicitly removes the snapshot.
+
+Snapshots are isolated by browser tab and survive closing/reopening the panel, component remounts, and page reloads within the current extension session. Turning inspection ON again keeps the previous snapshot until you explicitly select another element. Refresh and DOM navigation require active inspection and a live selection; after stopping inspection or restoring saved data, use **Select another element** or click a new element on the webpage. Moving the mouse, hiding a dropdown, or removing its DOM node never recaptures or clears the snapshot.
+
 Use the sun/moon button beside the inspector toggle to switch between light and dark mode. Dark is the default. Layr remembers your choice locally across panel sessions; this changes the panel's appearance without changing the website you're inspecting.
 
 ### After Making Changes
@@ -101,6 +106,8 @@ Layr runs locally in your browser.
 No account, backend, analytics, or cloud connection is required.
 Layr does not send inspected page data anywhere.
 
+Redacted snapshots are kept in `chrome.storage.session`, an in-memory store keyed by tab ID. The `storage` permission enables this session-only preservation; inspection data is not written to `chrome.storage.local`, sync storage, or localStorage. A tab's snapshot is removed when that tab closes or when you clear its selection. Chrome clears session storage on browser restart, extension reload/update, or extension disable. Theme preferences remain in localStorage separately.
+
 Password field values are not read. Form value attributes, textarea/select contents, editable text, scripts, inline event handlers, sensitive attributes and recognized secret patterns are redacted before inspection details leave the page context. URL query/fragment parameter values and URL credentials are also redacted. Sensitive CSS custom properties are redacted.
 
 Redaction is heuristic and cannot recognize every private value in arbitrary page text or CSS. Review copied details before sharing them. Copying only puts details on your clipboard; Layr does not contact an AI service.
@@ -115,6 +122,7 @@ Some Chrome internal pages and protected browser content cannot be inspected. Ce
 - Child navigation lists up to 100 children, including children of open shadow roots. Select a child to continue deeper. Breadcrumbs can cross open shadow-root hosts.
 - Details are a snapshot. Use the refresh button to capture later changes. Moving to the inspect icon can end the target's hover state. The label itself does not intercept pointer events; frames are shielded because their click events cannot be intercepted by the parent page. Page handlers registered earlier at the window capture phase can run before Layr's listeners.
 - Local files need **Allow access to file URLs** enabled in Layr's Chrome extension settings.
+- A saved snapshot can predate a page reload or navigation in the same tab. It is captured data, not live DOM; select a new element to replace it. Session snapshots do not survive browser restarts or extension reloads and are subject to Chrome's session-storage quota.
 
 ## Checks
 
@@ -123,7 +131,7 @@ npm run build
 npm test
 ```
 
-Tests exercise the production build in Playwright Chromium, including selection, normal hover behavior, CSS coverage, DOM navigation, redaction, clipboard output, and panel lifecycle. If Chromium is not installed for Playwright, run `npx playwright install chromium` first.
+Tests exercise the production build in Playwright Chromium, including selection, normal hover behavior, CSS coverage, DOM navigation, redaction, clipboard output, themes, and saved-snapshot lifecycle. Snapshot regressions cover hover dropdowns, frozen CSS, DOM removal, ON/OFF toggles, listener cleanup, remounts, page reloads, per-tab isolation, explicit clearing, and tab-close cleanup. If Chromium is not installed for Playwright, run `npx playwright install chromium` first.
 
 ## Built With
 

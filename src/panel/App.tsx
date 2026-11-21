@@ -443,7 +443,8 @@ function SourceDeclarations({ selector, items, label, onCopy }: {
 
 export function App() {
   const { theme, toggleTheme } = useTheme();
-  const { enabled, inspection, tab, error, busy, run } = useInspector();
+  const { enabled, inspection, selectionStatus, tab, error, busy, run } = useInspector();
+  const liveSelection = enabled && selectionStatus === "live";
   const [active, setActive] = useState<Tab>("Overview");
   const [notice, setNotice] = useState("");
   useEffect(() => {
@@ -453,7 +454,7 @@ export function App() {
   }, [notice]);
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && enabled) void run({ type: "LAYR_CLEAR" });
+      if (event.key === "Escape" && inspection) void run({ type: "LAYR_CLEAR" });
       if (
         event.key === "/" &&
         active === "Styles" &&
@@ -532,7 +533,7 @@ export function App() {
           {domain}
         </span>
         <span className={`status-dot ${enabled ? "live" : ""}`} />
-        <span>{enabled ? "Inspecting" : "Standby"}</span>
+        <span>{enabled ? "Inspecting" : "Inspector OFF"}</span>
       </div>
       {error && (
         <div className="error activation-help" id="page-access-help" role="status">
@@ -560,7 +561,7 @@ export function App() {
           </button>
         ))}
       </nav>
-      {inspection && enabled ? (
+      {inspection ? (
         <>
           <div className="selection">
             <div className="selection-heading">
@@ -569,8 +570,8 @@ export function App() {
                 <button
                   className="icon-button"
                   aria-label="Refresh inspection"
-                  title="Refresh inspection"
-                  disabled={busy}
+                  title={liveSelection ? "Refresh inspection" : "Select an element while inspection is ON to refresh"}
+                  disabled={busy || !liveSelection}
                   onClick={() => void run({ type: "LAYR_REFRESH" })}
                 >
                   <RefreshCw size={13} />
@@ -579,6 +580,7 @@ export function App() {
                   className="icon-button"
                   aria-label="Clear selection"
                   title="Clear selection (Esc)"
+                  disabled={busy}
                   onClick={() => void run({ type: "LAYR_CLEAR" })}
                 >
                   <X size={14} />
@@ -602,24 +604,32 @@ export function App() {
                 {number(inspection.rect.height)}
               </span>
             </div>
+            <div className="snapshot-controls">
+              <span className="snapshot-status" title={`Captured ${new Date(inspection.capturedAt).toLocaleString()}`}>
+                {liveSelection ? "Snapshot captured" : "Saved inspection"}
+              </span>
+              <button className="filter" disabled={busy || !tab}
+                onClick={() => void run({ type: "LAYR_ENABLE", enabled: true })}>Select another element</button>
+            </div>
+            {selectionStatus === "detached" && <p className="hint" role="status">Element no longer on page — showing captured details</p>}
           </div>
           <main className="inspector-content">
             <Section title="DOM navigation">
               <nav className="breadcrumbs" aria-label="DOM breadcrumb path">
                 {inspection.breadcrumb.map((item, index) => (
-                  <button key={item.key} disabled={busy || index === inspection.breadcrumb.length - 1}
+                  <button key={item.key} disabled={busy || !liveSelection || index === inspection.breadcrumb.length - 1}
                     aria-current={index === inspection.breadcrumb.length - 1 ? "location" : undefined}
                     onClick={() => void run({ type: "LAYR_NAVIGATE", key: item.key })}>
                     {item.label}
                   </button>
                 ))}
               </nav>
-              <button className="filter" disabled={busy || inspection.breadcrumb.length < 2}
+              <button className="filter" disabled={busy || !liveSelection || inspection.breadcrumb.length < 2}
                 onClick={() => void run({ type: "LAYR_NAVIGATE", key: inspection.breadcrumb.at(-2)!.key })}>Select parent</button>
               <details className="children-navigation">
                 <summary>Child elements ({inspection.children.length})</summary>
                 <div className="child-list">{inspection.children.map((item) => (
-                  <button className="filter" key={item.key} disabled={busy}
+                  <button className="filter" key={item.key} disabled={busy || !liveSelection}
                     onClick={() => void run({ type: "LAYR_NAVIGATE", key: item.key })}>{item.label}</button>
                 ))}</div>
               </details>

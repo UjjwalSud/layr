@@ -8,13 +8,13 @@ import { chromium } from "playwright";
 
 const dist = path.resolve("dist");
 
-test("production manifest uses only the three required permissions and local assets", async () => {
+test("production manifest uses only the required permissions and local assets", async () => {
   const manifest = JSON.parse(
     await readFile(path.join(dist, "manifest.json"), "utf8"),
   );
   assert.deepEqual(
     manifest.permissions.sort(),
-    ["activeTab", "scripting", "sidePanel"].sort(),
+    ["activeTab", "scripting", "sidePanel", "storage"].sort(),
   );
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.host_permissions, undefined);
@@ -313,7 +313,7 @@ test(
     const removedKey = state.inspection.children[0].key;
     await page.locator("#email").evaluate((element) => element.remove());
     state = await send({ type: "LAYR_NAVIGATE", key: removedKey });
-    assert.equal(state.inspection.id, "private-info", "detached navigation targets refresh safely");
+    assert.equal(state.inspection.id, "private-info", "detached navigation targets preserve the snapshot");
 
     await page.locator("#duplicates span").nth(1).click({ force: true });
     state = await waitFor((state) => state.inspection?.text === "Second");
@@ -495,12 +495,13 @@ test(
     });
     await send({ type: "LAYR_ENABLE", enabled: true });
     await page.locator("#target").click({ force: true });
+    const removedSnapshot = (await get()).inspection;
     await page.locator("#target").evaluate((element) => element.remove());
     await send({ type: "LAYR_REFRESH" });
-    assert.equal(
+    assert.deepEqual(
       (await get()).inspection,
-      null,
-      "removed selection clears safely",
+      removedSnapshot,
+      "removed selection keeps its captured details",
     );
     await page.reload();
     assert.equal(
@@ -524,7 +525,7 @@ test(
       await chrome.sidePanel.close({ windowId: tab.windowId });
     }, tabId);
     state = await waitFor((state) => !state.enabled);
-    assert.equal(state.inspection, null, "closing the panel clears selection");
+    assert.equal(state.inspection.id, "target", "closing the panel preserves the snapshot");
     assert.equal(await page.locator("[data-layr-overlay]").count(), 0);
     assert.equal(
       await worker.evaluate(
@@ -655,4 +656,246 @@ test("browser: panel themes persist locally, sync, and tolerate unavailable stor
   await darkButton().waitFor();
   assert.equal(await panel.locator("html").getAttribute("data-theme"), "light", "themes still switch when preference storage is unavailable");
   assert.deepEqual(errors, [], "theme changes cause no runtime errors");
+});
+
+test("browser: frozen snapshots survive OFF, dropdown dismissal, DOM removal, remounts, and tab changes", { timeout: 120000 }, async (t) => {
+  const folder = await mkdtemp(path.join(tmpdir(), "layr-snapshot-test-"));
+  const errors = [];
+  const server = createServer((_request, response) => {
+    response.setHeader("Content-Type", "text/html");
+    response.end(`<!doctype html><style>
+      body { margin:0; padding:80px; min-height:1300px; font:16px sans-serif; }
+      #menu { position:relative; width:240px; padding:15px; background:#ddd; }
+      #dropdown { display:none; position:absolute; top:100%; left:0; padding:10px; background:#eee; }
+      #menu:hover #dropdown { display:block; }
+      #dropdown-item { width:210px; height:40px; color:white; background:rgb(30, 40, 50); }
+      #dropdown-item:hover { background:rgb(37, 99, 235); --hover-accent:blue; }
+      #first, #second { display:block; margin-top:100px; width:220px; height:40px; }
+    </style><div id="menu">Hover menu<div id="dropdown"><button id="dropdown-item" data-token="snapshot-secret">Ephemeral dropdown item</button></div></div>
+    <button id="first">First permanent button</button><button id="second">Second permanent button</button>
+    <script>window.pageHovers=0; window.pageClicks=0;
+      document.addEventListener('pointerover', () => window.pageHovers++);
+      document.addEventListener('click', () => window.pageClicks++);
+    </script>`);
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  let context;
+  t.after(async () => {
+    await context?.close();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(folder, { recursive: true, force: true });
+  });
+  context = await chromium.launchPersistentContext(path.join(folder, "profile"), {
+    channel: "chromium", headless: true, viewport: { width: 1100, height: 850 },
+    args: ["--enable-unsafe-extension-debugging", `--disable-extensions-except=${dist}`, `--load-extension=${dist}`],
+  });
+  const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
+  const extensionId = new URL(worker.url()).hostname;
+  const panelUrl = `chrome-extension://${extensionId}/sidepanel.html`;
+  const browserCdp = await context.browser().newBrowserCDPSession();
+  const page = await context.newPage();
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  const pageCdp = await context.newCDPSession(page);
+  const isolatedContexts = [];
+  pageCdp.on("Runtime.executionContextCreated", ({ context }) => {
+    if (context.auxData?.isDefault === false) isolatedContexts.push(context.id);
+  });
+  await pageCdp.send("Runtime.enable");
+  let listenerContext;
+  const listeners = async (expression) => {
+    const { result } = await pageCdp.send("Runtime.evaluate", { expression, contextId: listenerContext });
+    const { listeners } = await pageCdp.send("DOMDebugger.getEventListeners", { objectId: result.objectId });
+    return listeners.map((item) => `${item.type}:${item.useCapture}`).sort();
+  };
+  const activate = async (targetPage) => {
+    await targetPage.bringToFront();
+    // The worker target can exist before its module imports register the action.
+    await worker.evaluate(async () => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (chrome.action.onClicked.hasListeners()) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error("Extension action listener did not initialize");
+    });
+    const { targetInfos } = await browserCdp.send("Target.getTargets", { filter: [{ type: "tab" }] });
+    await browserCdp.send("Extensions.triggerAction", {
+      id: extensionId, targetId: targetInfos.find((target) => target.url === targetPage.url()).targetId,
+    });
+    const tabId = await worker.evaluate(async () => (await chrome.tabs.query({ active: true, currentWindow: true }))[0].id);
+    try {
+      await targetPage.locator("[data-layr-overlay]").waitFor({ state: "attached", timeout: 10000 });
+    } catch (error) {
+      const state = await worker.evaluate((tabId) => chrome.tabs.sendMessage(tabId, { type: "LAYR_GET_STATE" }).catch(String), tabId);
+      assert.fail(`Activation failed: ${JSON.stringify({ tabId, state, errors })}; ${error}`);
+    }
+    return tabId;
+  };
+  const tabA = await activate(page);
+  for (const contextId of isolatedContexts) {
+    const { result } = await pageCdp.send("Runtime.evaluate", { contextId, expression: "globalThis.chrome?.runtime?.id" });
+    if (result.value === extensionId) listenerContext = contextId;
+  }
+  assert.ok(listenerContext, "listener audit uses the extension's isolated execution world");
+  const send = (tabId, message) => worker.evaluate(({ tabId, message }) =>
+    chrome.tabs.sendMessage(tabId, message, { frameId: 0 }), { tabId, message });
+  const get = () => send(tabA, { type: "LAYR_GET_STATE" });
+  const saved = (tabId, expected) => worker.evaluate(async ({ tabId, expected }) => {
+    const key = `layr:inspection:${tabId}`;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const inspection = (await chrome.storage.session.get(key))[key] ?? null;
+      if (expected === null ? inspection === null :
+        inspection?.capturedAt === expected.capturedAt && inspection?.id === expected.id) return { inspection };
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`Session snapshot did not match for tab ${tabId}`);
+  }, { tabId, expected });
+  assert.ok((await listeners("window")).length > 0, "listener audit sees active inspection listeners");
+
+  await page.locator("#menu").hover({ force: true });
+  await page.locator("#dropdown-item").click({ force: true });
+  const captured = (await get()).inspection;
+  assert.equal(captured.id, "dropdown-item");
+  assert.equal(captured.computed["background-color"], "rgb(37, 99, 235)", "capture includes the current hover CSS");
+  assert.equal(captured.computed["--hover-accent"], "blue");
+  assert.ok(captured.rules.some((rule) => rule.selector === "#dropdown-item:hover"));
+  assert.ok(!JSON.stringify(captured).includes("snapshot-secret"));
+  assert.deepEqual((await saved(tabA, captured)).inspection, captured, "only the redacted serializable snapshot is saved");
+  await page.mouse.move(700, 600);
+  await page.locator("#dropdown").waitFor({ state: "hidden" });
+  assert.deepEqual((await get()).inspection, captured, "closing a hover dropdown preserves its exact captured HTML and CSS");
+  await page.locator("#second").hover({ force: true });
+  assert.deepEqual((await get()).inspection, captured, "hovering another element does not replace the snapshot");
+
+  let panel = await context.newPage();
+  panel.on("pageerror", (error) => errors.push(error.message));
+  await panel.goto(panelUrl);
+  await page.bringToFront();
+  await panel.getByText("SELECTED ELEMENT", { exact: true }).waitFor();
+  // Leave only our controllable panel context so closing it tests actual cleanup.
+  await worker.evaluate(async (tabId) => chrome.sidePanel.close({ windowId: (await chrome.tabs.get(tabId)).windowId }), tabA);
+  await panel.getByRole("button", { name: "Styles", exact: true }).click();
+  const search = panel.getByRole("textbox", { name: "Filter CSS properties" });
+  await search.fill("background-color");
+  await panel.getByRole("switch", { name: "Inspection mode" }).click();
+  await panel.getByText("Inspector OFF", { exact: true }).waitFor();
+  await panel.getByText("Saved inspection", { exact: true }).waitFor();
+  assert.deepEqual((await get()).inspection, captured);
+  assert.equal(await search.inputValue(), "background-color", "turning OFF preserves the mounted search/filter");
+  assert.equal(await panel.getByRole("button", { name: "Refresh inspection", exact: true }).isDisabled(), true);
+  assert.equal(await panel.getByRole("button", { name: "Select parent", exact: true }).isDisabled(), true);
+  assert.equal(await page.locator("[data-layr-overlay]").count(), 0);
+  assert.deepEqual(await listeners("window"), [], "OFF removes every Layr window event listener");
+  assert.deepEqual(await listeners("document"), [], "OFF removes every Layr document event listener");
+  const priorHovers = await page.evaluate(() => window.pageHovers);
+  await page.locator("#first").hover();
+  await page.locator("#first").click();
+  assert.ok(await page.evaluate((prior) => window.pageHovers > prior, priorHovers), "normal page hover behavior works while OFF");
+  assert.equal(await page.evaluate(() => window.pageClicks), 1, "normal buttons work while OFF");
+  assert.deepEqual((await get()).inspection, captured, "OFF cannot select another page element");
+  const panelCdp = await context.newCDPSession(panel);
+  await panelCdp.send("Emulation.setFocusEmulationEnabled", { enabled: true });
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await panel.getByRole("button", { name: "Copy all computed CSS", exact: true }).click();
+  assert.match(await panel.evaluate(() => navigator.clipboard.readText()), /background-color: rgb\(37, 99, 235\)/);
+  await panel.getByRole("button", { name: "Overview", exact: true }).click();
+  await panel.getByRole("button", { name: "Copy HTML", exact: true }).click();
+  assert.equal(await panel.evaluate(() => navigator.clipboard.readText()), captured.html);
+  await panel.getByRole("button", { name: "Copy inspection", exact: true }).click();
+  assert.match(await panel.evaluate(() => navigator.clipboard.readText()), /Ephemeral dropdown item/);
+  await panel.getByRole("button", { name: "Copy for AI", exact: true }).click();
+  assert.ok(!(await panel.evaluate(() => navigator.clipboard.readText())).includes("snapshot-secret"));
+
+  await panel.getByRole("switch", { name: "Inspection mode" }).click();
+  assert.equal((await get()).enabled, true);
+  assert.deepEqual((await get()).inspection, captured, "turning ON retains the original snapshot without recapture");
+  await panel.close();
+  await page.waitForFunction(() => !document.querySelector("[data-layr-overlay]"));
+  assert.equal((await get()).enabled, false);
+  assert.deepEqual((await get()).inspection, captured, "closing the last panel stops tracking but keeps the snapshot");
+  panel = await context.newPage();
+  panel.on("pageerror", (error) => errors.push(error.message));
+  await panel.goto(panelUrl);
+  await page.bringToFront();
+  await panel.getByText("Saved inspection", { exact: true }).waitFor();
+  assert.match(await panel.locator(".selected-name").innerText(), /dropdown-item/);
+  await panel.reload();
+  await page.bringToFront();
+  await panel.getByText("Saved inspection", { exact: true }).waitFor();
+  assert.deepEqual((await saved(tabA, captured)).inspection, captured, "component remounts retain the saved snapshot");
+
+  const other = await context.newPage();
+  await other.goto(`http://127.0.0.1:${server.address().port}/other`);
+  await other.bringToFront();
+  await panel.getByRole("heading", { name: "A closer look starts here.", exact: true }).waitFor();
+  assert.equal(await panel.getByText("SELECTED ELEMENT", { exact: true }).count(), 0, "an unrelated tab never shows A's snapshot");
+  const tabB = await activate(other);
+  await other.locator("#second").click({ force: true });
+  await panel.locator(".selected-name").filter({ hasText: "second" }).waitFor();
+  const capturedB = (await send(tabB, { type: "LAYR_GET_STATE" })).inspection;
+  await panel.getByRole("switch", { name: "Inspection mode" }).click();
+  assert.deepEqual((await saved(tabB, capturedB)).inspection, capturedB);
+  await page.bringToFront();
+  await panel.locator(".selected-name").filter({ hasText: "dropdown-item" }).waitFor();
+  await other.bringToFront();
+  await panel.locator(".selected-name").filter({ hasText: "second" }).waitFor();
+  await other.close();
+  await page.bringToFront();
+  await panel.locator(".selected-name").filter({ hasText: "dropdown-item" }).waitFor();
+  assert.equal((await saved(tabB, null)).inspection, null, "closing a tab removes its session snapshot");
+  await panel.getByRole("button", { name: "Clear selection", exact: true }).click();
+  await panel.getByRole("heading", { name: "A closer look starts here.", exact: true }).waitFor();
+  assert.equal((await get()).inspection, null);
+  assert.equal((await saved(tabA, null)).inspection, null, "explicit Clear works while OFF and deletes session data");
+  await panel.reload();
+  await page.bringToFront();
+  await panel.getByRole("heading", { name: "A closer look starts here.", exact: true }).waitFor();
+  assert.equal(await panel.getByText("SELECTED ELEMENT", { exact: true }).count(), 0, "cleared data never reappears after a remount");
+
+  await panel.getByRole("switch", { name: "Inspection mode" }).click();
+  await page.locator("#first").click({ force: true });
+  const first = (await get()).inspection;
+  await page.locator("#second").hover({ force: true });
+  assert.deepEqual((await get()).inspection, first);
+  await page.locator("#second").click({ force: true });
+  const second = (await get()).inspection;
+  assert.equal(second.id, "second", "an explicit new selection replaces the old snapshot");
+  await page.locator("#second").evaluate((element) => element.remove());
+  await panel.getByText("Element no longer on page — showing captured details", { exact: true }).waitFor();
+  assert.deepEqual((await get()).inspection, second, "DOM removal does not mutate the snapshot");
+  const reopenedCdp = await context.newCDPSession(panel);
+  await reopenedCdp.send("Emulation.setFocusEmulationEnabled", { enabled: true });
+  await panel.getByRole("button", { name: "Copy HTML", exact: true }).click();
+  assert.equal(await panel.evaluate(() => navigator.clipboard.readText()), second.html);
+  await panel.getByRole("button", { name: "Styles", exact: true }).click();
+  await panel.getByRole("button", { name: "Copy all computed CSS", exact: true }).click();
+  assert.ok((await panel.evaluate(() => navigator.clipboard.readText())).includes("#second {"));
+  await panel.getByRole("switch", { name: "Inspection mode" }).click();
+  assert.deepEqual((await get()).inspection, second, "a removed node's HTML and CSS remain when turned OFF");
+  assert.deepEqual((await saved(tabA, second)).inspection, second);
+
+  // A document reload destroys every content-script reference. Restore from
+  // session storage and keep navigation disabled until a fresh selection.
+  await page.reload();
+  await panel.getByText("Saved inspection", { exact: true }).waitFor();
+  assert.match(await panel.locator(".selected-name").innerText(), /second/);
+  await panel.getByRole("button", { name: "Select another element", exact: true }).click();
+  await page.locator("[data-layr-overlay]").waitFor({ state: "attached" });
+  assert.deepEqual((await get()).inspection, second, "a newly injected content script restores the saved snapshot without recapture");
+  await panel.getByRole("switch", { name: "Inspection mode" }).click();
+  await page.reload();
+  await panel.getByText("Saved inspection", { exact: true }).waitFor();
+  await panel.getByRole("button", { name: "Clear selection", exact: true }).click();
+  await panel.getByRole("heading", { name: "A closer look starts here.", exact: true }).waitFor();
+  assert.equal((await saved(tabA, null)).inspection, null, "clearing saved data works even without a content script");
+  const { targetInfos } = await browserCdp.send("Target.getTargets", { filter: [{ type: "tab" }] });
+  await browserCdp.send("Extensions.triggerAction", {
+    id: extensionId, targetId: targetInfos.find((target) => target.url === page.url()).targetId,
+  });
+  await page.locator("[data-layr-overlay]").waitFor({ state: "attached" });
+  assert.equal((await get()).inspection, null, "content script restoration cannot resurrect an explicitly cleared snapshot");
+  assert.deepEqual(await worker.evaluate(async () => ({
+    local: await chrome.storage.local.get(null), sync: await chrome.storage.sync.get(null),
+  })), { local: {}, sync: {} }, "no inspection data is persisted to permanent Chrome storage");
+  assert.deepEqual(errors, [], "snapshot lifecycle has no runtime errors");
 });

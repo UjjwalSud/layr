@@ -981,3 +981,5 @@ footer {
 .declaration-status.overridden > span { color:#bba17f; }
 .source-code { padding:12px; font:10px/1.8 var(--font-mono); color:#a9b6cc; max-height:360px; overflow:auto; }
 .source-selector { display:block; padding-right:24px; overflow-wrap:anywhere; }
+.snapshot-controls { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.snapshot-status { color:inherit; font-size:9px; opacity:.8; }

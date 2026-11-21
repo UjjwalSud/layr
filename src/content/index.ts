@@ -1,5 +1,6 @@
 import { capture } from "./capture";
 import { hoverDescription, redactText } from "./privacy";
+import { storedSnapshot } from "../shared/snapshots";
 import type { ContentCommand, InspectorState } from "../shared/types";
 
 // Injection is idempotent, including concurrent toolbar / panel activation.
@@ -7,16 +8,21 @@ const global = window as typeof window & { __layrInstalled?: boolean };
 if (!global.__layrInstalled) {
   global.__layrInstalled = true;
   let enabled = false;
-  let selected: Element | null = null;
+  let selected: WeakRef<Element> | null = null;
   let hovered: Element | null = null;
   let inspection: InspectorState["inspection"] = null;
+  let selectionStatus: InspectorState["selectionStatus"] = null;
+  const ready = storedSnapshot().then((snapshot) => {
+    inspection = snapshot;
+    selectionStatus = snapshot ? "saved" : null;
+  });
   let host: HTMLDivElement | null = null;
   let hoverBox: HTMLDivElement;
   let selectionBox: HTMLDivElement;
   let button: HTMLButtonElement;
   let label: HTMLSpanElement;
   let shields: HTMLDivElement;
-  const navigation = new Map<number, Element>();
+  const navigation = new Map<number, WeakRef<Element>>();
   let nextKey = 0;
   let controller: AbortController | null = null;
   let observer: ResizeObserver | null = null;
@@ -28,10 +34,10 @@ if (!global.__layrInstalled) {
   let buttonBounds: { left: number; top: number; width: number } | null = null;
   const panelSessions = new Set<chrome.runtime.Port>();
 
-  const state = (): InspectorState => ({ enabled, inspection });
-  const publish = () => {
+  const state = (): InspectorState => ({ enabled, inspection, selectionStatus });
+  const publish = (snapshotChanged = false) => {
     void chrome.runtime
-      .sendMessage({ type: "LAYR_STATE", state: state() })
+      .sendMessage({ type: "LAYR_STATE", state: state(), snapshotChanged })
       .catch(() => {});
   };
   const stop = (event: Event) => {
@@ -75,7 +81,7 @@ if (!global.__layrInstalled) {
       return null;
     }
     const rect = element.getBoundingClientRect();
-    if (!rect.width && !rect.height) {
+    if ((!rect.width && !rect.height) || getComputedStyle(element).visibility === "hidden") {
       box.style.display = "none";
       return null;
     }
@@ -110,17 +116,14 @@ if (!global.__layrInstalled) {
     frame = 0;
     if (!enabled) return;
     updateFrameShields();
-    if (selected && !selected.isConnected) {
-      selected = null;
-      inspection = null;
-      navigation.clear();
-      publish();
-    }
-    positionBox(selectionBox, selected);
+    const target = selected?.deref();
+    if (selected && !target?.isConnected) detachSelection();
+    positionBox(selectionBox, target ?? null);
     if (point) {
       hovered = atPoint(point.x, point.y);
       point = null;
     }
+    if (!hovered?.isConnected) hovered = null;
     const rect = positionBox(hoverBox, hovered);
     if (!rect || !hovered) {
       button.style.display = "none";
@@ -176,25 +179,40 @@ if (!global.__layrInstalled) {
   const schedule = () => {
     if (!frame) frame = requestAnimationFrame(draw);
   };
+  function detachSelection() {
+    selected = null;
+    navigation.clear();
+    observer?.disconnect();
+    selectionStatus = inspection ? "detached" : null;
+    publish();
+  }
   function clear() {
     selected = null;
     inspection = null;
+    selectionStatus = null;
     navigation.clear();
     observer?.disconnect();
-    publish();
-    schedule();
+    publish(true);
+    if (enabled) schedule();
   }
   function select(element: Element) {
-    selected = element;
-    navigation.clear();
-    inspection = capture(element, (target) => {
+    if (!element.isConnected) return;
+    const links = new Map<number, WeakRef<Element>>();
+    // Commit only after a complete, redacted capture succeeds. Hover drawing
+    // and DOM observers never recapture or mutate this serializable snapshot.
+    const snapshot = capture(element, (target) => {
       const key = ++nextKey;
-      navigation.set(key, target);
+      links.set(key, new WeakRef(target));
       return { key, label: redactText(`${target.localName}${target.id ? `#${target.id}` : ""}${Array.from(target.classList).slice(0, 2).map((name) => `.${name}`).join("")}`).slice(0, 160) };
     });
+    selected = new WeakRef(element);
+    navigation.clear();
+    for (const [key, target] of links) navigation.set(key, target);
+    inspection = snapshot;
+    selectionStatus = "live";
     observer?.disconnect();
     observer?.observe(element);
-    publish();
+    publish(true);
     schedule();
   }
 
@@ -216,7 +234,7 @@ if (!global.__layrInstalled) {
       host = null;
       selected = null;
       hovered = null;
-      inspection = null;
+      selectionStatus = inspection ? "saved" : null;
       navigation.clear();
       point = null;
       buttonBounds = null;
@@ -347,34 +365,40 @@ if (!global.__layrInstalled) {
 
   chrome.runtime.onMessage.addListener(
     (message: ContentCommand, _sender, respond) => {
-      switch (message.type) {
-        case "LAYR_GET_STATE":
-          respond(state());
-          break;
-        case "LAYR_ENABLE":
-          setEnabled(message.enabled);
-          respond(state());
-          break;
-        case "LAYR_CLEAR":
-          if (enabled) clear();
-          respond(state());
-          break;
-        case "LAYR_REFRESH":
-          if (enabled && selected?.isConnected) select(selected);
-          else if (enabled) clear();
-          respond(state());
-          break;
-        case "LAYR_NAVIGATE": {
-          const target = navigation.get(message.key);
-          if (enabled && target?.isConnected) {
-            target.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
-            select(target);
-          } else if (enabled && selected?.isConnected) select(selected);
-          else if (enabled) clear();
-          respond(state());
-          break;
+      if (!["LAYR_GET_STATE", "LAYR_ENABLE", "LAYR_CLEAR", "LAYR_REFRESH", "LAYR_NAVIGATE"].includes(message.type)) return;
+      void ready.then(() => {
+        switch (message.type) {
+          case "LAYR_GET_STATE":
+            respond(state());
+            break;
+          case "LAYR_ENABLE":
+            setEnabled(message.enabled);
+            respond(state());
+            break;
+          case "LAYR_CLEAR":
+            clear();
+            respond(state());
+            break;
+          case "LAYR_REFRESH":
+            if (enabled && selected) {
+              const target = selected.deref();
+              if (target?.isConnected) select(target);
+              else detachSelection();
+            }
+            respond(state());
+            break;
+          case "LAYR_NAVIGATE": {
+            const target = navigation.get(message.key)?.deref();
+            if (enabled && target?.isConnected) {
+              target.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+              select(target);
+            }
+            respond(state());
+            break;
+          }
         }
-      }
+      }).catch((error) => respond({ error: String(error) }));
+      return true;
     },
   );
 }

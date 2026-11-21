@@ -43,6 +43,7 @@ export interface Inspection {
 export interface InspectorState {
   enabled: boolean;
   inspection: Inspection | null;
+  selectionStatus: "live" | "detached" | "saved" | null;
 }
 export type ContentCommand =
   | { type: "LAYR_GET_STATE" }
@@ -53,4 +54,8 @@ export type ContentCommand =
 export interface StateEvent {
   type: "LAYR_STATE";
   state: InspectorState;
+  snapshotChanged: boolean;
 }
+export type SnapshotCommand =
+  | { type: "LAYR_GET_SNAPSHOT"; tabId?: number }
+  | { type: "LAYR_CLEAR_SNAPSHOT"; tabId: number };

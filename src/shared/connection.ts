@@ -1,10 +1,13 @@
 import type { ContentCommand, InspectorState } from "./types";
 
-export const command = (
+export const command = async (
   tabId: number,
   message: ContentCommand,
-): Promise<InspectorState> =>
-  chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+): Promise<InspectorState> => {
+  const result = await chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+  if (result?.error) throw new Error(result.error);
+  return result;
+};
 
 export async function enableTab(tabId: number): Promise<InspectorState> {
   try {

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { command, enableTab, pageError } from "../shared/connection";
+import { clearStoredSnapshot, savedState } from "../shared/snapshots";
 import type {
   ContentCommand,
   InspectorState,
   StateEvent,
 } from "../shared/types";
 
-const empty: InspectorState = { enabled: false, inspection: null };
+const empty: InspectorState = { enabled: false, inspection: null, selectionStatus: null };
 
 export function useInspector() {
   const [state, setState] = useState<InspectorState>(empty);
@@ -15,6 +16,7 @@ export function useInspector() {
   const [busy, setBusy] = useState(false);
   const currentTab = useRef<number | undefined>(undefined);
   const generation = useRef(0);
+  const updates = useRef(0);
   const windowId = useRef<number | undefined>(undefined);
   const sessions = useRef(new Map<number, chrome.runtime.Port>());
 
@@ -44,14 +46,22 @@ export function useInspector() {
     setState(empty);
     setError("");
     if (active?.id === undefined) return;
+    const updateVersion = updates.current;
     try {
       const next = await command(active.id, { type: "LAYR_GET_STATE" });
-      if (version === generation.current) {
+      if (version === generation.current && updateVersion === updates.current) {
         if (next.enabled) watchTab(active.id);
         setState(next);
       }
     } catch {
-      if (version === generation.current) setError(pageError(active.url));
+      try {
+        const saved = await savedState(active.id);
+        if (version === generation.current && updateVersion === updates.current) setState(saved);
+      } catch {
+        // The access hint below also covers an unavailable session snapshot.
+      } finally {
+        if (version === generation.current) setError(pageError(active.url));
+      }
     }
   }, [watchTab]);
 
@@ -63,7 +73,7 @@ export function useInspector() {
       void sync();
     });
     const receive = (
-      message: StateEvent | { type: "LAYR_UNAVAILABLE"; tabId: number },
+      message: StateEvent | { type: "LAYR_UNAVAILABLE" | "LAYR_SNAPSHOT_CLEARED"; tabId: number },
       sender: chrome.runtime.MessageSender,
     ) => {
       if (
@@ -79,6 +89,7 @@ export function useInspector() {
         sender.tab?.id === currentTab.current &&
         sender.frameId === 0
       ) {
+        updates.current++;
         setState(message.state);
         setError("");
       } else if (
@@ -86,6 +97,10 @@ export function useInspector() {
         message.tabId === currentTab.current
       )
         void sync();
+      else if (message.type === "LAYR_SNAPSHOT_CLEARED" && message.tabId === currentTab.current) {
+        updates.current++;
+        setState((previous) => ({ ...previous, inspection: null, selectionStatus: null }));
+      }
     };
     const activate = (info: chrome.tabs.OnActivatedInfo) => {
       if (info.windowId === windowId.current) void sync();
@@ -123,8 +138,28 @@ export function useInspector() {
       }
     } catch {
       if (currentTab.current === id) {
-        setState(empty);
-        setError(pageError(tab?.url));
+        if (message.type === "LAYR_CLEAR") {
+          try {
+            const cleared = await clearStoredSnapshot(id);
+            if (currentTab.current === id) setState(cleared);
+          } catch {
+            // Keep the available in-memory snapshot if session storage fails.
+          }
+        } else {
+          try {
+            const saved = await savedState(id);
+            if (currentTab.current === id) setState((previous) => ({
+              ...saved,
+              inspection: saved.inspection ?? previous.inspection,
+              selectionStatus: saved.inspection || previous.inspection ? "saved" : null,
+            }));
+          } catch {
+            if (currentTab.current === id) setState((previous) => ({
+              ...previous, enabled: false, selectionStatus: previous.inspection ? "saved" : null,
+            }));
+          }
+        }
+        if (currentTab.current === id) setError(pageError(tab?.url));
       }
     } finally {
       setBusy(false);
