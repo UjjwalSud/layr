@@ -23,6 +23,7 @@ export function inspectionText(data: Inspection): string {
     "# Layr inspection",
     `Captured: ${data.capturedAt}\nSelector: ${data.selector}\nScope: ${data.scope}\nTag: ${data.tag}\nID: ${data.id || "(none)"}\nClasses: ${data.classes.join(" ") || "(none)"}`,
     `## Element text\n${data.text || "(empty)"}`,
+    ...(data.hoverState ? [`## Captured interaction state\n${JSON.stringify(data.hoverState, null, 2)}`] : []),
     `## Attributes\n${data.attributes.map(([key, value]) => `${key}=${JSON.stringify(value)}`).join("\n") || "(none)"}`,
     `## HTML${data.htmlTruncated ? " (truncated at 60,000 characters)" : ""}\n\`\`\`html\n${data.html}\n\`\`\``,
     `## Layout (viewport bounds; transforms included)\n${JSON.stringify(data.rect, null, 2)}`,

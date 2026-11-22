@@ -7,6 +7,12 @@
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
   "background": { "service_worker": "background.js", "type": "module" },
+  "commands": {
+    "toggle-freeze-hover": {
+      "suggested_key": { "default": "Alt+Shift+F" },
+      "description": "Freeze or unfreeze Layr hover inspection"
+    }
+  },
   "action": {
     "default_title": "Inspect with Layr",
     "default_icon": {

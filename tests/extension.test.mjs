@@ -5,8 +5,207 @@ import { mkdtemp, readFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { chromium } from "playwright";
+import { build } from "vite";
 
 const dist = path.resolve("dist");
+
+test("browser: Freeze Hover captures CSS tooltips, React portals, menus and cleans up on OFF", { timeout: 120000 }, async (t) => {
+  const fixtureEntry = path.resolve("tests/hover-fixture.js");
+  const reactFixture = await build({
+    configFile: false, logLevel: "silent", define: { "process.env.NODE_ENV": JSON.stringify("production") },
+    plugins: [{ name: "hover-fixture", resolveId: (id) => id === fixtureEntry ? id : undefined,
+      load: (id) => id === fixtureEntry ? `
+        import React from 'react'; import {createRoot} from 'react-dom/client'; import {createPortal} from 'react-dom';
+        function Fixture() {
+          const [open, setOpen] = React.useState(false);
+          return React.createElement(React.Fragment, null,
+            React.createElement('button', {id:'react-trigger', onPointerEnter:()=>setOpen(true), onPointerLeave:()=>setOpen(false)}, 'React trigger'),
+            open && createPortal(React.createElement('div', {id:'react-tip', role:'tooltip', 'data-state':'open', 'data-token':'portal-secret', style:{position:'fixed',left:400,top:150,padding:12,background:'pink'}}, 'React portal tooltip'), document.body));
+        }
+        createRoot(document.getElementById('react-root')).render(React.createElement(Fixture));
+      ` : undefined }],
+    build: { write: false, lib: { entry: fixtureEntry, formats: ["iife"], name: "HoverFixture" } },
+  });
+  const script = (Array.isArray(reactFixture) ? reactFixture[0] : reactFixture).output.find((entry) => entry.type === "chunk").code;
+  const folder = await mkdtemp(path.join(tmpdir(), "layr-hover-test-"));
+  const server = createServer((request, response) => {
+    response.setHeader("Content-Type", request.url === "/react.js" ? "text/javascript" : "text/html");
+    response.end(request.url === "/react.js" ? script : `<!doctype html><style>
+      body{padding:80px;font:16px sans-serif} button{padding:12px} #css-trigger{position:relative;width:170px;padding:15px;background:#ddd}
+      #css-tip{position:absolute;top:65px;left:0;visibility:hidden;opacity:0;background:rgb(10,20,30);color:white;padding:10px;width:140px;--hover-color:blue}
+      #css-trigger:hover #css-tip{visibility:visible;opacity:1} #menu{position:relative;margin-top:100px;padding:15px;width:200px;background:#ddd}
+      #submenu{display:none;position:absolute;top:60px;background:#eee;padding:10px} #menu:hover #submenu{display:block}
+      #react-root{margin-top:100px}
+      #delayed-trigger{position:fixed;left:700px;top:80px;padding:15px;background:#ddd}
+      #delayed-tip{position:absolute;top:65px;left:0;opacity:0;transition:opacity 0s;background:#ffc;padding:10px;width:140px}
+      #delayed-trigger:hover #delayed-tip{opacity:1;transition-delay:.7s}
+      #visibility-trigger{position:fixed;left:700px;top:350px;padding:15px;background:#ddd}
+      .visibility-parent{position:absolute;top:65px;display:none;visibility:hidden}
+      #visibility-trigger:hover .visibility-parent{display:block}
+      #visibility-tip{visibility:visible;background:#cff;padding:10px;width:140px}
+    </style><div id="css-trigger" aria-describedby="css-tip">Home<div id="css-tip" class="floating-label" role="tooltip" data-token="tooltip-secret">Home tooltip</div></div>
+    <div id="menu">Menu<div id="submenu" role="menu"><button role="menuitem" id="menu-child">Nested action</button></div></div>
+    <div id="delayed-trigger">Delayed hover<div id="delayed-tip" role="tooltip">Delayed tooltip</div></div>
+    <div id="visibility-trigger">Visibility override<div class="visibility-parent"><div id="visibility-tip" role="tooltip">Visible child tooltip</div></div></div>
+    <div id="react-root"></div><button id="ordinary" style="margin-top:100px">Ordinary selection</button><div id="large"></div>
+    <script>window.leaveCount=0;document.getElementById('css-trigger').addEventListener('pointerleave',()=>window.leaveCount++);
+    window.addEventListener('keydown',event=>{if(window.blockFreezeKey && event.altKey && event.shiftKey && event.code==='KeyF'){event.preventDefault();event.stopImmediatePropagation();}},true);
+    document.getElementById('large').innerHTML='<span>large page</span>'.repeat(6000);</script><script src="/react.js"></script>`);
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  let context;
+  t.after(async () => { await context?.close(); await new Promise((resolve) => server.close(resolve)); await rm(folder, { recursive: true, force: true }); });
+  context = await chromium.launchPersistentContext(path.join(folder, "profile"), {
+    channel: "chromium", headless: true, viewport: { width: 1100, height: 850 },
+    args: ["--enable-unsafe-extension-debugging", `--disable-extensions-except=${dist}`, `--load-extension=${dist}`],
+  });
+  const errors = [];
+  const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
+  const extensionId = new URL(worker.url()).hostname;
+  const page = await context.newPage(); page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}/`); await page.bringToFront();
+  await worker.evaluate(async () => { while (!chrome.action.onClicked.hasListeners()) await new Promise((resolve) => setTimeout(resolve, 20)); });
+  const cdp = await context.browser().newBrowserCDPSession();
+  const { targetInfos } = await cdp.send("Target.getTargets", { filter: [{ type: "tab" }] });
+  await cdp.send("Extensions.triggerAction", { id: extensionId, targetId: targetInfos.find((target) => target.url === page.url()).targetId });
+  await page.locator("[data-layr-overlay]").waitFor({ state: "attached" });
+  const tabId = await worker.evaluate(async () => (await chrome.tabs.query({ active: true, currentWindow: true }))[0].id);
+  const send = (message) => worker.evaluate(({ tabId, message }) => chrome.tabs.sendMessage(tabId, message), { tabId, message });
+  const get = () => send({ type: "LAYR_GET_STATE" });
+  const frozenTarget = async (text) => {
+    const state = await get(); const target = state.temporaryTargets.find((entry) => entry.text === text);
+    assert.ok(target, `Missing ${text}: ${JSON.stringify(state.temporaryTargets)}`); return target;
+  };
+  const panel = await context.newPage(); panel.on("pageerror", (error) => errors.push(error.message));
+  await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`); await page.bringToFront();
+  await panel.getByRole("button", { name: "Freeze hover", exact: true }).waitFor();
+  const shortcuts = await worker.evaluate(() => chrome.commands.getAll());
+  assert.ok(shortcuts.some((entry) => entry.name === "toggle-freeze-hover" && entry.shortcut === "Alt+Shift+F"), "Chrome registers the Freeze shortcut");
+
+  await page.locator("#css-trigger").hover();
+  await page.keyboard.press("Alt+Shift+f");
+  assert.equal((await get()).frozen, true);
+  await panel.getByText("Hover frozen", { exact: true }).waitFor();
+  await page.mouse.move(900, 700);
+  assert.equal(await page.locator("#css-tip").isVisible(), false);
+  assert.ok(await page.evaluate(() => window.leaveCount) > 0, "website pointerleave runs normally");
+  const cssTarget = await frozenTarget("Home tooltip"); assert.equal(cssTarget.status, "captured");
+  await panel.getByRole("region", { name: "Temporary inspection targets" }).getByRole("button").filter({ hasText: "[tooltip]" }).click();
+  const css = (await get()).inspection;
+  assert.equal(css.id, "css-tip"); assert.equal(css.computed.visibility, "visible");
+  assert.equal(css.computed["background-color"], "rgb(10, 20, 30)");
+  assert.ok(css.rules.some((rule) => rule.selector === "#css-trigger:hover #css-tip"));
+  assert.ok(!JSON.stringify(css).includes("tooltip-secret"));
+  await panel.getByText("Captured temporary element — read-only inspection preview", { exact: true }).waitFor();
+  await panel.getByRole("button", { name: "Unfreeze hover", exact: true }).click();
+  assert.deepEqual((await get()).inspection, css, "unfreeze retains captured HTML/CSS");
+  await page.locator("#ordinary").hover({ force: true }); assert.deepEqual((await get()).inspection, css);
+
+  // An unmarked CSS tooltip is captured before moving into the side panel.
+  await page.locator("#css-tip").evaluate((node) => node.removeAttribute("role"));
+  await page.locator("#css-trigger").evaluate((node) => node.removeAttribute("aria-describedby"));
+  await page.locator("#css-trigger").hover({ force: true });
+  await page.waitForTimeout(350);
+  await page.mouse.move(900, 700);
+  await panel.getByRole("button", { name: "Freeze hover", exact: true }).click();
+  const recentCss = await frozenTarget("Home tooltip");
+  assert.equal(recentCss.status, "captured", "panel Freeze can select a tooltip captured before the mouse left");
+  await send({ type: "LAYR_SELECT_TEMPORARY", key: recentCss.key });
+  assert.equal((await get()).inspection.computed.visibility, "visible");
+  await send({ type: "LAYR_FREEZE", frozen: false });
+
+  await page.locator("#delayed-trigger").hover({ force: true });
+  await page.waitForFunction(() => getComputedStyle(document.getElementById('delayed-tip')).opacity === '1');
+  await page.waitForTimeout(150);
+  await page.mouse.move(900, 700);
+  await panel.getByRole("button", { name: "Freeze hover", exact: true }).click();
+  const delayed = await frozenTarget("Delayed tooltip");
+  await send({ type: "LAYR_SELECT_TEMPORARY", key: delayed.key });
+  assert.equal((await get()).inspection.computed.opacity, "1", "delayed CSS tooltips are captured while visible before entering the panel");
+  await send({ type: "LAYR_FREEZE", frozen: false });
+
+  await page.locator("#visibility-trigger").hover({ force: true });
+  await page.waitForTimeout(150);
+  await page.keyboard.press("Alt+Shift+f");
+  await page.mouse.move(900, 700);
+  const visibleChild = await frozenTarget("Visible child tooltip");
+  await send({ type: "LAYR_SELECT_TEMPORARY", key: visibleChild.key });
+  assert.equal((await get()).inspection.id, "visibility-tip", "visible descendants override ancestor visibility:hidden");
+  await send({ type: "LAYR_FREEZE", frozen: false });
+
+  await page.evaluate(() => { window.blockFreezeKey = true; });
+  await page.locator("#css-trigger").hover({ force: true });
+  await page.keyboard.press("Alt+Shift+f");
+  // CDP synthetic keys don't run Chrome's native command dispatcher. Exercise
+  // its content-message entry point separately from the page's blocked keys.
+  assert.equal((await get()).frozen, false, "fixture consumes the page-level shortcut");
+  await send({ type: "LAYR_TOGGLE_FREEZE" });
+  assert.equal((await get()).frozen, true, "browser-command message bypasses page key handlers");
+  await send({ type: "LAYR_FREEZE", frozen: false });
+  await page.evaluate(() => { window.blockFreezeKey = false; });
+
+  await page.locator("#react-trigger").hover({ force: true });
+  await page.locator("#react-tip").waitFor();
+  await page.keyboard.press("Alt+Shift+f");
+  await page.mouse.move(900, 700); await page.locator("#react-tip").waitFor({ state: "detached" });
+  const reactTarget = await frozenTarget("React portal tooltip"); assert.equal(reactTarget.status, "captured");
+  await send({ type: "LAYR_SELECT_TEMPORARY", key: reactTarget.key });
+  const react = (await get()).inspection;
+  assert.equal(react.id, "react-tip"); assert.equal(react.hoverState.state, "open");
+  assert.equal(react.computed.position, "fixed"); assert.ok(!JSON.stringify(react).includes("portal-secret"));
+  await page.keyboard.press("Escape");
+  assert.equal((await get()).frozen, false); assert.deepEqual((await get()).inspection, react);
+  await page.keyboard.press("Escape"); assert.deepEqual((await get()).inspection, react);
+
+  await page.locator("#menu").hover({ force: true }); await page.keyboard.press("Alt+Shift+f");
+  await page.mouse.move(900, 700);
+  const child = await frozenTarget("Nested action");
+  // Prefer the individual menu item, rather than its menu container with the same text.
+  const menuChild = (await get()).temporaryTargets.find((target) => target.role === "menuitem");
+  assert.ok(menuChild); await send({ type: "LAYR_SELECT_TEMPORARY", key: menuChild.key });
+  const menu = (await get()).inspection; assert.equal(menu.id, "menu-child"); assert.ok(child);
+  await send({ type: "LAYR_ENABLE", enabled: false });
+  assert.deepEqual((await get()).inspection, menu); assert.equal((await get()).frozen, false);
+  assert.deepEqual((await get()).temporaryTargets, []); assert.equal(await page.locator("[data-layr-overlay]").count(), 0);
+  await worker.evaluate((tabId) => chrome.scripting.executeScript({ target: { tabId }, func: () => {
+    const Native = MutationObserver; window.__activeObservers = 0; window.__mutationCallbacks = 0;
+    window.MutationObserver = class extends Native {
+      active = false;
+      constructor(callback) { super((...args) => { window.__mutationCallbacks++; callback(...args); }); }
+      observe(...args) { super.observe(...args); if (!this.active) { this.active = true; window.__activeObservers++; } }
+      disconnect() { super.disconnect(); if (this.active) { this.active = false; window.__activeObservers--; } }
+    };
+  } }), tabId);
+  await send({ type: "LAYR_ENABLE", enabled: true });
+
+  // Audit whole-document scans in the extension world while a large app updates.
+  await worker.evaluate((tabId) => chrome.scripting.executeScript({ target: { tabId }, func: () => {
+    window.__wholeScans = 0; const query = Document.prototype.querySelectorAll;
+    Document.prototype.querySelectorAll = function(selector) { if (selector === "*") window.__wholeScans++; return query.call(this, selector); };
+  } }), tabId);
+  await page.evaluate(async () => {
+    for (let batch = 0; batch < 12; batch++) {
+      const node = document.createElement('div'); node.textContent = 'dynamic update'; document.getElementById('large').append(node);
+      await new Promise((resolve) => requestAnimationFrame(resolve)); node.remove();
+    }
+  });
+  const [audit] = await worker.evaluate((tabId) => chrome.scripting.executeScript({ target: { tabId }, func: () => window.__wholeScans }), tabId);
+  assert.equal(audit.result, 0, "DOM updates never rescan the entire document");
+  await page.locator("#ordinary").click({ force: true }); assert.equal((await get()).inspection.id, "ordinary");
+  await send({ type: "LAYR_FREEZE", frozen: true });
+  await send({ type: "LAYR_CLEAR" }); assert.equal((await get()).inspection, null);
+  await send({ type: "LAYR_ENABLE", enabled: false });
+  const observerAudit = () => worker.evaluate(async (tabId) => (await chrome.scripting.executeScript({ target: { tabId },
+    func: () => ({ active: window.__activeObservers, callbacks: window.__mutationCallbacks }) }))[0].result, tabId);
+  const stopped = await observerAudit(); assert.equal(stopped.active, 0, "OFF disconnects every inspection MutationObserver");
+  await page.evaluate(async () => {
+    document.getElementById('large').append(document.createElement('div'));
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  });
+  assert.deepEqual(await observerAudit(), stopped, "page mutations cannot restart capture after OFF");
+  await send({ type: "LAYR_FREEZE", frozen: true }); assert.equal((await get()).frozen, false, "OFF cannot restart hover capture");
+  assert.deepEqual(errors, []);
+});
 
 test("production manifest uses only the required permissions and local assets", async () => {
   const manifest = JSON.parse(
@@ -343,6 +542,8 @@ test(
       state.inspection.notes.some((note) => note.includes("Frame contents")),
     );
     await page.keyboard.press("Escape");
+    assert.equal((await get()).inspection.id, "frame", "Escape preserves selection; only Clear deletes it");
+    await send({ type: "LAYR_CLEAR" });
     assert.equal((await get()).inspection, null);
 
     await page.locator("#target").click({ force: true });

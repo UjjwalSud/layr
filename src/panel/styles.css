@@ -4,6 +4,12 @@
   --font-sans: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
 }
+.freeze-controls { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 20px; border-bottom:1px solid #80808026; }
+.temporary-targets { padding:8px 20px; border-bottom:1px solid #80808026; max-height:240px; overflow:auto; }
+.temporary-target { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:4px 8px; text-align:left; width:100%; padding:8px; margin:5px 0; border:1px solid #80808040; border-radius:6px; background:transparent; color:inherit; }
+.temporary-target code, .temporary-target > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.temporary-target code { grid-column:1 / -1; }
+.temporary-target small { color:#739bdf; }
 :root {
   font-family: var(--font-sans);
   color: #d9dce4;

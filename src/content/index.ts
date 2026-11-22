@@ -1,6 +1,7 @@
 import { capture } from "./capture";
 import { hoverDescription, redactText } from "./privacy";
 import { storedSnapshot } from "../shared/snapshots";
+import { TemporaryCapture, visible } from "./temporary";
 import type { ContentCommand, InspectorState } from "../shared/types";
 
 // Injection is idempotent, including concurrent toolbar / panel activation.
@@ -27,14 +28,17 @@ if (!global.__layrInstalled) {
   let controller: AbortController | null = null;
   let observer: ResizeObserver | null = null;
   let mutations: MutationObserver | null = null;
+  let shadowRoots: WeakRef<ShadowRoot>[] = [];
   let frames: Element[] = [];
   let framesDirty = true;
   let frame = 0;
   let point: { x: number; y: number } | null = null;
   let buttonBounds: { left: number; top: number; width: number } | null = null;
+  let temporaryStatuses = "";
   const panelSessions = new Set<chrome.runtime.Port>();
 
-  const state = (): InspectorState => ({ enabled, inspection, selectionStatus });
+  const temporary = new TemporaryCapture(ownElement, () => { schedule(); });
+  const state = (): InspectorState => ({ enabled, frozen: temporary.frozen, temporaryTargets: temporary.targets(), inspection, selectionStatus });
   const publish = (snapshotChanged = false) => {
     void chrome.runtime
       .sendMessage({ type: "LAYR_STATE", state: state(), snapshotChanged })
@@ -47,8 +51,9 @@ if (!global.__layrInstalled) {
   const ownEvent = (event: Event) =>
     host !== null && event.composedPath().includes(host);
   const buttonEvent = (event: Event) => event.composedPath().includes(button);
-  const ownElement = (element: Element) =>
-    element === host || element.getRootNode() === host?.shadowRoot;
+  function ownElement(element: Element) {
+    return element === host || element.getRootNode() === host?.shadowRoot;
+  }
 
   function makeOverlay() {
     host = document.createElement("div");
@@ -119,6 +124,16 @@ if (!global.__layrInstalled) {
     const target = selected?.deref();
     if (selected && !target?.isConnected) detachSelection();
     positionBox(selectionBox, target ?? null);
+    if (temporary.frozen) {
+      if (selected && target && !visible(target)) detachSelection();
+      const statuses = temporary.targets().map((target) => `${target.key}:${target.status}`).join();
+      if (statuses !== temporaryStatuses) { temporaryStatuses = statuses; publish(); }
+      hoverBox.style.display = "none";
+      button.style.display = "none";
+      buttonBounds = null;
+      point = null;
+      return;
+    }
     if (point) {
       hovered = atPoint(point.x, point.y);
       point = null;
@@ -159,9 +174,11 @@ if (!global.__layrInstalled) {
       framesDirty = false;
       frames = [];
       mutations?.disconnect();
+      shadowRoots = [];
       const find = (root: Document | ShadowRoot) => {
         frames.push(...root.querySelectorAll("iframe, frame"));
-        mutations?.observe(root, { childList: true, subtree: true, attributes: true });
+        observeRoot(root);
+        temporary.register(root);
         for (const node of root.querySelectorAll("*")) {
           if (node !== host && node.shadowRoot) find(node.shadowRoot);
         }
@@ -175,6 +192,13 @@ if (!global.__layrInstalled) {
     }
     while (shields.children.length > frames.length) shields.lastElementChild?.remove();
     frames.forEach((element, index) => positionBox(shields.children[index] as HTMLElement, element));
+  }
+  function observeRoot(root: Document | ShadowRoot) {
+    if (root instanceof ShadowRoot) {
+      if (shadowRoots.some((ref) => ref.deref() === root)) return;
+      shadowRoots.push(new WeakRef(root));
+    }
+    mutations?.observe(root, { childList: true, subtree: true, attributes: true, characterData: true });
   }
   const schedule = () => {
     if (!frame) frame = requestAnimationFrame(draw);
@@ -216,16 +240,56 @@ if (!global.__layrInstalled) {
     schedule();
   }
 
+  function freeze(next: boolean) {
+    if (!enabled || temporary.frozen === next) return;
+    if (next) {
+      temporary.freeze();
+      hovered = null;
+      point = null;
+      publish();
+    }
+    else {
+      temporary.unfreeze();
+      temporaryStatuses = "";
+      hovered = null;
+      point = null;
+      publish();
+      schedule();
+    }
+  }
+
+  function toggleFreezeShortcut() {
+    if (!enabled) return;
+    freeze(!temporary.frozen);
+  }
+
+  function selectTemporary(key: number) {
+    const entry = temporary.target(key);
+    if (!enabled || !entry) return;
+    // Always use the capture made while visible, even if the live node changed.
+    inspection = entry.inspection;
+    const element = entry.ref.deref();
+    selected = temporary.isLive(key) && element ? new WeakRef(element) : null;
+    selectionStatus = selected ? "live" : "captured";
+    navigation.clear();
+    observer?.disconnect();
+    if (selected && element) observer?.observe(element);
+    publish(true);
+    schedule();
+  }
+
   function setEnabled(next: boolean) {
     if (enabled === next) return;
     enabled = next;
     if (!next) {
+      temporary.reset();
       controller?.abort();
       controller = null;
       observer?.disconnect();
       observer = null;
       mutations?.disconnect();
       mutations = null;
+      shadowRoots = [];
       frames = [];
       framesDirty = true;
       cancelAnimationFrame(frame);
@@ -247,13 +311,48 @@ if (!global.__layrInstalled) {
     observer = new ResizeObserver(schedule);
     mutations = new MutationObserver((records) => {
       if (!records.some((record) => !(record.target instanceof Element) || !ownElement(record.target))) return;
-      framesDirty = records.some((record) => record.type === "childList") || framesDirty;
+      temporary.mutations(records);
+      if (shadowRoots.length && records.some((record) => record.removedNodes.length)) {
+        const connected = shadowRoots.map((ref) => ref.deref()).filter((root): root is ShadowRoot => !!root?.host.isConnected);
+        if (connected.length !== shadowRoots.length) {
+          // MutationObserver has no unobserve(root); rebuild its subscriptions
+          // without rescanning the page or retaining removed shadow trees.
+          mutations?.disconnect();
+          shadowRoots = [];
+          observeRoot(document);
+          for (const root of connected) observeRoot(root);
+        }
+      }
+      // Track new frame/shadow subtrees incrementally. Ordinary React updates
+      // must not cause repeated querySelectorAll('*') scans of the whole page.
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element) || ownElement(node)) continue;
+          const visit = (element: Element) => {
+            if (element.matches("iframe, frame") && !frames.includes(element)) frames.push(element);
+            if (element.shadowRoot) {
+              observeRoot(element.shadowRoot);
+              temporary.register(element.shadowRoot);
+              for (const child of element.shadowRoot.querySelectorAll("*")) visit(child);
+            }
+          };
+          visit(node);
+          for (const child of node.querySelectorAll("*")) visit(child);
+        }
+      }
+      frames = frames.filter((element) => element.isConnected);
       schedule();
     });
     updateFrameShields();
+    window.addEventListener("pointerover", (event) => {
+      if (ownEvent(event) || temporary.frozen) return;
+      const element = event.composedPath().find((node): node is Element => node instanceof Element);
+      if (element) temporary.hover(element);
+    }, { ...options, passive: true });
     window.addEventListener(
       "pointermove",
       (event) => {
+        if (temporary.frozen) { schedule(); return; }
         if (buttonEvent(event)) return;
         // Keep the target stable while crossing the small gap to its inspect icon.
         if (
@@ -293,6 +392,7 @@ if (!global.__layrInstalled) {
       (event) => {
         const own = buttonEvent(event);
         stop(event);
+        if (temporary.frozen) return;
         const element = own ? hovered : atPoint(event.clientX, event.clientY);
         if (element) select(element);
       },
@@ -301,9 +401,14 @@ if (!global.__layrInstalled) {
     window.addEventListener(
       "keydown",
       (event) => {
-        if (event.key === "Escape") {
+        if (event.altKey && event.shiftKey && event.code === "KeyF") {
           stop(event);
-          clear();
+          if (!event.repeat) toggleFreezeShortcut();
+        } else if (event.key === "Escape" && temporary.frozen) {
+          stop(event);
+          freeze(false);
+        } else if (temporary.frozen) {
+          if (event.key === "Enter" || event.key === " ") stop(event);
         } else if (
           ownEvent(event) &&
           (event.key === "Enter" || event.key === " ")
@@ -365,7 +470,7 @@ if (!global.__layrInstalled) {
 
   chrome.runtime.onMessage.addListener(
     (message: ContentCommand, _sender, respond) => {
-      if (!["LAYR_GET_STATE", "LAYR_ENABLE", "LAYR_CLEAR", "LAYR_REFRESH", "LAYR_NAVIGATE"].includes(message.type)) return;
+      if (!["LAYR_GET_STATE", "LAYR_ENABLE", "LAYR_CLEAR", "LAYR_REFRESH", "LAYR_NAVIGATE", "LAYR_FREEZE", "LAYR_TOGGLE_FREEZE", "LAYR_SELECT_TEMPORARY"].includes(message.type)) return;
       void ready.then(() => {
         switch (message.type) {
           case "LAYR_GET_STATE":
@@ -377,6 +482,18 @@ if (!global.__layrInstalled) {
             break;
           case "LAYR_CLEAR":
             clear();
+            respond(state());
+            break;
+          case "LAYR_FREEZE":
+            freeze(message.frozen);
+            respond(state());
+            break;
+          case "LAYR_TOGGLE_FREEZE":
+            toggleFreezeShortcut();
+            respond(state());
+            break;
+          case "LAYR_SELECT_TEMPORARY":
+            selectTemporary(message.key);
             respond(state());
             break;
           case "LAYR_REFRESH":

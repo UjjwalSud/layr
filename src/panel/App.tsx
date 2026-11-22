@@ -93,6 +93,9 @@ function Overview({ data, onCopy }: { data: Inspection; onCopy: CopyHandler }) {
       <Section title="Attributes" count={data.attributes.length}>
         <Properties entries={data.attributes} onCopy={onCopy} />
       </Section>
+      {data.hoverState && <Section title="Captured interaction state">
+        <Properties entries={Object.entries(data.hoverState).map(([key, value]) => [key, String(value ?? "(unset)")])} onCopy={onCopy} />
+      </Section>}
       <Section title="HTML snippet">
         <CodeBlock text={data.html} label="Copy HTML" onCopy={onCopy} />
         {data.htmlTruncated && (
@@ -443,7 +446,7 @@ function SourceDeclarations({ selector, items, label, onCopy }: {
 
 export function App() {
   const { theme, toggleTheme } = useTheme();
-  const { enabled, inspection, selectionStatus, tab, error, busy, run } = useInspector();
+  const { enabled, frozen, temporaryTargets, inspection, selectionStatus, tab, error, busy, run } = useInspector();
   const liveSelection = enabled && selectionStatus === "live";
   const [active, setActive] = useState<Tab>("Overview");
   const [notice, setNotice] = useState("");
@@ -454,7 +457,11 @@ export function App() {
   }, [notice]);
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && inspection) void run({ type: "LAYR_CLEAR" });
+      if (event.key === "Escape" && frozen) void run({ type: "LAYR_FREEZE", frozen: false });
+      if (event.altKey && event.shiftKey && event.code === "KeyF" && enabled) {
+        event.preventDefault();
+        if (!event.repeat) void run({ type: "LAYR_TOGGLE_FREEZE" });
+      }
       if (
         event.key === "/" &&
         active === "Styles" &&
@@ -535,6 +542,23 @@ export function App() {
         <span className={`status-dot ${enabled ? "live" : ""}`} />
         <span>{enabled ? "Inspecting" : "Inspector OFF"}</span>
       </div>
+      <div className="freeze-controls">
+        <span>{frozen ? "Hover frozen" : `Freeze Hover ${enabled ? "OFF" : "unavailable"}`}</span>
+        <button className={`filter ${frozen ? "active" : ""}`} disabled={!enabled || busy}
+          aria-label={frozen ? "Unfreeze hover" : "Freeze hover"} aria-pressed={frozen}
+          title="Freeze visible or recently captured hover targets (Alt+Shift+F)"
+          onClick={() => void run({ type: "LAYR_FREEZE", frozen: !frozen })}>
+          {frozen ? "Unfreeze" : "Freeze"}
+        </button>
+      </div>
+      {frozen && <section className="temporary-targets" aria-label="Temporary inspection targets">
+        <p className="hint">Select a target to preview its captured HTML, CSS and layout. Page hover events continue normally.</p>
+        {temporaryTargets.length ? temporaryTargets.map((target) => <button className="temporary-target" key={target.key}
+          disabled={busy} onClick={() => void run({ type: "LAYR_SELECT_TEMPORARY", key: target.key })}>
+          <code>&lt;{target.tag}&gt;{target.classes.map((name) => `.${name}`).join("")}{target.role ? ` [${target.role}]` : ""}</code>
+          <span>{target.text || "(no text)"}</span><small>{target.status === "live" ? "Live" : "Captured"}</small>
+        </button>) : <p className="hint">No temporary targets captured. Unfreeze, hover the trigger, then press Alt+Shift+F while the element is visible.</p>}
+      </section>}
       {error && (
         <div className="error activation-help" id="page-access-help" role="status">
           <AlertCircle size={16} />
@@ -579,7 +603,7 @@ export function App() {
                 <button
                   className="icon-button"
                   aria-label="Clear selection"
-                  title="Clear selection (Esc)"
+                  title="Clear selection"
                   disabled={busy}
                   onClick={() => void run({ type: "LAYR_CLEAR" })}
                 >
@@ -612,6 +636,7 @@ export function App() {
                 onClick={() => void run({ type: "LAYR_ENABLE", enabled: true })}>Select another element</button>
             </div>
             {selectionStatus === "detached" && <p className="hint" role="status">Element no longer on page — showing captured details</p>}
+            {selectionStatus === "captured" && <p className="hint" role="status">Captured temporary element — read-only inspection preview</p>}
           </div>
           <main className="inspector-content">
             <Section title="DOM navigation">
@@ -718,7 +743,7 @@ export function App() {
         <span>
           {enabled ? (
             <>
-              <kbd>esc</kbd> clear selection
+              <kbd>Alt Shift F</kbd> freeze · <kbd>esc</kbd> unfreeze
             </>
           ) : (
             "Built for curious eyes."

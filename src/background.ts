@@ -1,4 +1,4 @@
-import { enableTab } from "./shared/connection";
+import { command, enableTab } from "./shared/connection";
 import { snapshotKey } from "./shared/snapshots";
 import type { SnapshotCommand, StateEvent } from "./shared/types";
 
@@ -25,6 +25,16 @@ chrome.action.onClicked.addListener((tab) => {
       .sendMessage({ type: "LAYR_UNAVAILABLE", tabId: tab.id })
       .catch(() => {});
   });
+});
+
+chrome.commands.onCommand.addListener((name, tab) => {
+  if (name !== "toggle-freeze-hover") return;
+  // Only toggle an already running inspector. A shortcut must not silently
+  // enable inspection or change the hovered page's focus by opening a panel.
+  void (async () => {
+    const tabId = tab?.id ?? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.id;
+    if (tabId !== undefined) await command(tabId, { type: "LAYR_TOGGLE_FREEZE" });
+  })().catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((message: StateEvent | SnapshotCommand, sender, respond) => {

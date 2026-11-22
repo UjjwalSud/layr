@@ -20,6 +20,7 @@ export interface SourceRule {
   declarations: Declaration[];
 }
 export interface Inspection {
+  hoverState?: { hovered: boolean; focusWithin: boolean; expanded: string | null; state: string | null };
   tag: string;
   text: string;
   id: string;
@@ -42,14 +43,27 @@ export interface Inspection {
 }
 export interface InspectorState {
   enabled: boolean;
+  frozen: boolean;
+  temporaryTargets: TemporaryTarget[];
   inspection: Inspection | null;
-  selectionStatus: "live" | "detached" | "saved" | null;
+  selectionStatus: "live" | "captured" | "detached" | "saved" | null;
+}
+export interface TemporaryTarget {
+  key: number;
+  tag: string;
+  text: string;
+  classes: string[];
+  role: string;
+  status: "live" | "captured";
 }
 export type ContentCommand =
   | { type: "LAYR_GET_STATE" }
   | { type: "LAYR_ENABLE"; enabled: boolean }
   | { type: "LAYR_CLEAR" }
   | { type: "LAYR_REFRESH" }
+  | { type: "LAYR_FREEZE"; frozen: boolean }
+  | { type: "LAYR_TOGGLE_FREEZE" }
+  | { type: "LAYR_SELECT_TEMPORARY"; key: number }
   | { type: "LAYR_NAVIGATE"; key: number };
 export interface StateEvent {
   type: "LAYR_STATE";

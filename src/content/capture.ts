@@ -186,6 +186,12 @@ export function capture(element: Element, link: (element: Element) => ElementLin
   const children = [...element.children, ...(element.shadowRoot?.children || [])].filter((child) => !child.hasAttribute("data-layr-overlay"));
   if (children.length > 100) source.notes.push("Child navigation shows the first 100 elements. Select a child to continue exploring.");
   return redactInspection({
+    hoverState: {
+      hovered: element.matches(":hover"),
+      focusWithin: element.matches(":focus-within"),
+      expanded: element.getAttribute("aria-expanded"),
+      state: element.getAttribute("data-state"),
+    },
     tag: element.localName,
     text: (safe.textContent ?? "").trim().slice(0, 2000),
     id: element.id,

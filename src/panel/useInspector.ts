@@ -7,7 +7,7 @@ import type {
   StateEvent,
 } from "../shared/types";
 
-const empty: InspectorState = { enabled: false, inspection: null, selectionStatus: null };
+const empty: InspectorState = { enabled: false, frozen: false, temporaryTargets: [], inspection: null, selectionStatus: null };
 
 export function useInspector() {
   const [state, setState] = useState<InspectorState>(empty);
@@ -155,7 +155,7 @@ export function useInspector() {
             }));
           } catch {
             if (currentTab.current === id) setState((previous) => ({
-              ...previous, enabled: false, selectionStatus: previous.inspection ? "saved" : null,
+              ...previous, enabled: false, frozen: false, temporaryTargets: [], selectionStatus: previous.inspection ? "saved" : null,
             }));
           }
         }
