@@ -136,9 +136,12 @@ export class TemporaryCapture {
       while (descendants <= 200 && walker.nextNode()) descendants++;
       if (descendants > 200) continue;
       try {
-        const inspection = capture(element, () => ({ key: 0, label: "" }));
-        inspection.breadcrumb = [];
-        inspection.children = [];
+        let capturedKey = 0;
+        const inspection = capture(element, (node) => ({ key: --capturedKey,
+          label: `${node.localName}${node.id ? `#${node.id}` : ""}${Array.from(node.classList).slice(0, 2).map((name) => `.${name}`).join("")}`.slice(0, 160) }));
+        // Keep the captured hierarchy even after portals disappear. These keys
+        // describe a snapshot and deliberately cannot navigate the live DOM.
+        inspection.navigationAvailable = false;
         this.captures.delete(key);
         this.captures.set(key, { ref: candidate.ref, inspection, seen: now });
         candidate.dirty = false;

@@ -394,7 +394,11 @@ if (!global.__layrInstalled) {
         stop(event);
         if (temporary.frozen) return;
         const element = own ? hovered : atPoint(event.clientX, event.clientY);
-        if (element) select(element);
+        if (element instanceof HTMLInputElement && /^(checkbox|radio)$/.test(element.type) && !own) {
+          // Checkbox/radio pre-activation temporarily flips :checked before
+          // click listeners run. Capture after canceled activation is restored.
+          window.setTimeout(() => { if (enabled && !temporary.frozen && element.isConnected) select(element); }, 0);
+        } else if (element) select(element);
       },
       options,
     );

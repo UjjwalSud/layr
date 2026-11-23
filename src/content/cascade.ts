@@ -34,6 +34,9 @@ export function classifyDeclarations(element: Element, inline: Declaration[], ru
   const entries = candidates.map((candidate) => {
     probe.cssText = "";
     probe.setProperty(candidate.item.property, candidate.item.value);
+    // Pending var() shorthands expose empty longhands in CSSOM. "initial"
+    // reveals the affected property names without resolving a page variable.
+    if (!candidate.item.property.startsWith("--") && /\bvar\(/i.test(candidate.item.value)) probe.setProperty(candidate.item.property, "initial");
     const affected = candidate.item.property.startsWith("--") ? [candidate.item.property] :
       names.filter((name) => !!probe.getPropertyValue(name));
     candidate.item.status = "unknown";

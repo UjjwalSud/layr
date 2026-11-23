@@ -12,10 +12,21 @@ export function redactText(text: string): string {
     .replace(/([?&#][\w.%+-]+=)[^\s"'<>#&)]*/g, "$1[redacted]");
 }
 
-export function sanitizedElement(element: Element): Element {
+export function sanitizedElement(element: Element, onTruncate?: () => void): Element {
   // An inert document prevents sanitized src/style URLs from loading resources.
   const inert = document.implementation.createHTMLDocument("");
-  const clone = inert.importNode(element, true) as Element;
+  let remaining = 2000;
+  function copy(node: Node, depth: number): Node {
+    const result = inert.importNode(node, false);
+    remaining--;
+    if (depth >= 80 && node.hasChildNodes()) { onTruncate?.(); return result; }
+    for (const child of node.childNodes) {
+      if (remaining <= 0) { onTruncate?.(); break; }
+      result.appendChild(copy(child, depth + 1));
+    }
+    return result;
+  }
+  const clone = copy(element, 0) as Element;
   for (const node of [clone, ...clone.querySelectorAll("*")]) {
     // Form values and editable text may contain arbitrary private user input.
     if (node.matches("input, textarea, select, [contenteditable]:not([contenteditable=false]), script")) {
